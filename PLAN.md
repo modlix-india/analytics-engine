@@ -824,6 +824,20 @@ Each ends in something runnable.
    first end-to-end query did not. It now advances to the next calendar boundary, which also
    makes a week a week and a DST day 23 or 25 hours.
 9. **Object storage** — WAL shipping, Parquet tier, retention by dropping date directories.
+   *(done)*
+
+   Proven end to end: ingest, compact, replicate, then delete every local Parquet file and
+   watch the same query return the identical answer from the bucket alone. WAL segments are
+   uploaded and then dropped once compacted, so the bucket holds no WAL at rest.
+
+   One gap found only by running it: `UseSSL` was hardcoded true, so a plaintext local
+   endpoint failed every upload. TLS is now derived from the endpoint's scheme — an `http://`
+   prefix means plaintext, a bare hostname means TLS, since a bare hostname in a deployment is
+   a real provider and defaulting that to plaintext would ship credentials in the clear.
+
+   Worth noting what worked during that failure: the engine logged the errors, kept serving
+   queries from local data, and deleted nothing. The degradation path was exercised by
+   accident and behaved as designed.
 
    Milestones 1-5 are complete. The half-hour timezone correction is implemented and tested
    against the case that motivated it: two events in the SAME UTC hour falling on opposite

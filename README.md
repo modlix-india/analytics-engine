@@ -32,6 +32,13 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 | `ANALYTICS_MAX_BATCH_EVENTS` | `500` | bound on one ingest request |
 | `ANALYTICS_MAX_BODY_BYTES` | `1MiB` | bound on one ingest request |
 | `ANALYTICS_LOG_LEVEL` | `info` | |
+| `ANALYTICS_QUERY_SECRET` | — | reads are denied entirely without it |
+| `ANALYTICS_S3_BUCKET` | — | set to enable object storage; everything stays local otherwise |
+| `ANALYTICS_S3_ENDPOINT` | — | `http://` prefix selects plaintext; anything else uses TLS |
+| `ANALYTICS_S3_ACCESS_KEY` / `_SECRET_KEY` / `_REGION` / `_PREFIX` | — | `OCI_S3_*` is accepted for the first three |
+| `ANALYTICS_REPLICATE_INTERVAL` | `1m` | |
+| `ANALYTICS_LOCAL_RETENTION` | `0` (keep) | how long Parquet stays on local disk after upload |
+| `ANALYTICS_REMOTE_RETENTION` | `0` (keep forever) | how long it stays in the bucket |
 
 ## Endpoints
 
@@ -126,6 +133,29 @@ Analytics ingest is spoofable in every product, this one included. Resolving a s
 themselves; it stops nothing from a script. Rate limiting in front is the real control. Do not
 treat ingest as an authenticated path.
 
+## Object storage
+
+Optional. With `ANALYTICS_S3_BUCKET` set, the engine replicates to any S3-compatible endpoint —
+written against OCI Object Storage, which the rest of the platform already uses.
+
+Two jobs, deliberately separate:
+
+- **WAL segments go up for durability**, closing the window where a node dies holding events
+  that exist nowhere else. They are deleted from the bucket once compaction has turned them
+  into Parquet, because at that point the copy protects nothing.
+- **Parquet goes up for queryability** and stays. Any node can then read any site's history,
+  which is what makes adding a node a configuration change rather than a migration: the new
+  node takes its share of new traffic and serves everything prior from the same bucket, with
+  no backfill.
+
+Queries reach through to the bucket for partitions that are not on local disk, caching what
+they fetch. So `ANALYTICS_LOCAL_RETENTION` trades disk for latency rather than for data.
+
+**Nothing local is deleted before its replacement is durable elsewhere.** A remote WAL copy is
+removed only once the local segment has gone, and the compactor removes a segment only after
+its Parquet is written and fsynced. Local Parquet is pruned only after a confirmed upload — an
+unreachable bucket costs disk, never data. Both retentions default to keeping everything.
+
 ## Tests
 
 ```bash
@@ -136,6 +166,17 @@ The `internal/query` package additionally checks every widget against **DuckDB**
 independent oracle: the same Parquet files, the same question, answered once through the
 rollup pipeline and once with plain SQL. Counts must match exactly; unique counts within the
 sketch's error bound.
+
+The object storage client has integration tests against a real server, skipped unless
+`AE_S3_ENDPOINT` is set:
+
+```bash
+docker run -d --rm -p 19000:9000 --name ae-minio \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+AE_S3_ENDPOINT=localhost:19000 AE_S3_BUCKET=aetest \
+  AE_S3_ACCESS_KEY=minioadmin AE_S3_SECRET_KEY=minioadmin \
+  go test ./internal/objstore/ -run TestS3
+```
 
 DuckDB is run as a subprocess and is not a Go dependency — it never enters `go.mod` or the
 binary, which is what keeps the `CGO_ENABLED=0` static build intact. Those tests skip if the

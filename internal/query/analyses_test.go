@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestFunnelCountsDepthPerVisitor(t *testing.T) {
 		evt(base, "view", "e"), evt(base.Add(time.Minute), "buy", "e"), evt(base.Add(2*time.Minute), "add", "e"),
 	}
 
-	res, err := New(fixture(t, rows)).Query(Request{
+	res, err := New(fixture(t, rows)).Query(context.Background(), Request{
 		Widget: WidgetFunnel, Site: "s.example", Steps: steps,
 		From: base.Add(-time.Hour), To: base.Add(time.Hour),
 	})
@@ -73,7 +74,7 @@ func TestFunnelWindowIsMeasuredFromTheFirstStep(t *testing.T) {
 		evt(base, "view", "outside"), evt(base.Add(10*time.Hour), "add", "outside"),
 	}
 
-	res, err := New(fixture(t, rows)).Query(Request{
+	res, err := New(fixture(t, rows)).Query(context.Background(), Request{
 		Widget: WidgetFunnel, Site: "s.example", Steps: steps, WindowHours: 6,
 		From: base.Add(-time.Hour), To: base.Add(24 * time.Hour),
 	})
@@ -94,7 +95,7 @@ func TestFunnelRejectsDegenerateRequests(t *testing.T) {
 	now := time.Now()
 
 	for _, steps := range [][]string{nil, {"only_one"}} {
-		if _, err := e.Query(Request{
+		if _, err := e.Query(context.Background(), Request{
 			Widget: WidgetFunnel, Site: "s", Steps: steps,
 			From: now.Add(-time.Hour), To: now,
 		}); err == nil {
@@ -113,7 +114,7 @@ func TestRetentionCohorts(t *testing.T) {
 		evt(day(2), "x", "c"), evt(day(3), "x", "c"),
 	}
 
-	res, err := New(fixture(t, rows)).Query(Request{
+	res, err := New(fixture(t, rows)).Query(context.Background(), Request{
 		Widget: WidgetRetention, Site: "s.example", Period: "day",
 		From: day(1).Add(-10 * time.Hour), To: day(3).Add(14 * time.Hour),
 	})
@@ -153,7 +154,7 @@ func TestStickinessHistogram(t *testing.T) {
 		evt(day(2), "x", "c"), evt(day(3), "x", "c"), // 2 days
 	}
 
-	res, err := New(fixture(t, rows)).Query(Request{
+	res, err := New(fixture(t, rows)).Query(context.Background(), Request{
 		Widget: WidgetStickiness, Site: "s.example", Period: "day",
 		From: day(1).Add(-10 * time.Hour), To: day(3).Add(14 * time.Hour),
 	})
@@ -180,7 +181,7 @@ func TestLifecycleClassification(t *testing.T) {
 		evt(day(1), "x", "b"), evt(day(3), "x", "b"),
 	}
 
-	res, err := New(fixture(t, rows)).Query(Request{
+	res, err := New(fixture(t, rows)).Query(context.Background(), Request{
 		Widget: WidgetLifecycle, Site: "s.example", Period: "day",
 		From: day(1).Add(-10 * time.Hour), To: day(3).Add(14 * time.Hour),
 	})
@@ -224,7 +225,7 @@ func TestResultIsIndependentOfPartitioning(t *testing.T) {
 	}
 
 	e := New(fixture(t, rows))
-	res, err := e.Query(Request{
+	res, err := e.Query(context.Background(), Request{
 		Widget: WidgetFunnel, Site: "s.example", Steps: []string{"view", "buy"},
 		From: base.Add(-time.Hour), To: base.Add(3 * time.Hour),
 	})

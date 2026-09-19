@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"hash/maphash"
 	"path/filepath"
@@ -55,11 +56,11 @@ func partitionOf(visitor string, parts int) int {
 //
 // fn must not retain the slice: it is reused between visitors, because allocating one per
 // visitor is the difference between a scan that fits in memory and one that does not.
-func (e *Engine) scanVisitors(site string, s span, parts, part int, fn func(visitor string, evs []seqEvent)) error {
+func (e *Engine) scanVisitors(ctx context.Context, site string, s span, parts, part int, fn func(visitor string, evs []seqEvent)) error {
 	byVisitor := map[string][]seqEvent{}
 
 	for _, date := range utcDates(s) {
-		files, err := e.filesIn("data", site, date)
+		files, err := e.filesIn(ctx, "data", site, date)
 		if err != nil {
 			return err
 		}
@@ -95,9 +96,9 @@ func (e *Engine) scanVisitors(site string, s span, parts, part int, fn func(visi
 }
 
 // eachVisitor runs fn over every visitor, one partition at a time.
-func (e *Engine) eachVisitor(site string, s span, fn func(visitor string, evs []seqEvent)) error {
+func (e *Engine) eachVisitor(ctx context.Context, site string, s span, fn func(visitor string, evs []seqEvent)) error {
 	for p := range visitorPartitions {
-		if err := e.scanVisitors(site, s, visitorPartitions, p, fn); err != nil {
+		if err := e.scanVisitors(ctx, site, s, visitorPartitions, p, fn); err != nil {
 			return err
 		}
 	}

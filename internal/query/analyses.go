@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"time"
@@ -44,7 +45,7 @@ type LifecyclePoint struct {
 }
 
 // funnel counts how far each visitor got through an ordered sequence.
-func (e *Engine) funnel(req Request, loc *time.Location) (*Result, error) {
+func (e *Engine) funnel(ctx context.Context, req Request, loc *time.Location) (*Result, error) {
 	if len(req.Steps) < 2 {
 		return nil, fmt.Errorf("query: a funnel needs at least two steps")
 	}
@@ -60,7 +61,7 @@ func (e *Engine) funnel(req Request, loc *time.Location) (*Result, error) {
 	}
 
 	counts := make([]uint64, len(req.Steps))
-	err := e.eachVisitor(req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
+	err := e.eachVisitor(ctx, req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
 		for i := range funnelDepth(evs, req.Steps, window) {
 			counts[i]++
 		}
@@ -86,7 +87,7 @@ func (e *Engine) funnel(req Request, loc *time.Location) (*Result, error) {
 }
 
 // retention groups visitors by the period they first appeared and tracks who came back.
-func (e *Engine) retention(req Request, loc *time.Location) (*Result, error) {
+func (e *Engine) retention(ctx context.Context, req Request, loc *time.Location) (*Result, error) {
 	weekly := req.Period == "week"
 	periods := periodsBetween(span{req.From, req.To}, loc, weekly)
 	if len(periods) == 0 {
@@ -104,7 +105,7 @@ func (e *Engine) retention(req Request, loc *time.Location) (*Result, error) {
 		grid[i] = make([]uint64, len(periods))
 	}
 
-	err := e.eachVisitor(req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
+	err := e.eachVisitor(ctx, req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
 		active := map[int]bool{}
 		for _, ev := range evs {
 			if req.Event != "" && ev.Name != req.Event {
@@ -147,11 +148,11 @@ func (e *Engine) retention(req Request, loc *time.Location) (*Result, error) {
 
 // stickiness counts, among visitors who did something at all, how many distinct periods they
 // did it in. It answers habit formation rather than reach.
-func (e *Engine) stickiness(req Request, loc *time.Location) (*Result, error) {
+func (e *Engine) stickiness(ctx context.Context, req Request, loc *time.Location) (*Result, error) {
 	weekly := req.Period == "week"
 	hist := map[int]uint64{}
 
-	err := e.eachVisitor(req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
+	err := e.eachVisitor(ctx, req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
 		periods := map[string]bool{}
 		for _, ev := range evs {
 			if req.Event != "" && ev.Name != req.Event {
@@ -186,7 +187,7 @@ func (e *Engine) stickiness(req Request, loc *time.Location) (*Result, error) {
 // event inside the range is on day one counts as new. Reading activity from before the range
 // would fix it and would mean scanning an unbounded history to answer a bounded question, so
 // the range is the stated horizon instead.
-func (e *Engine) lifecycle(req Request, loc *time.Location) (*Result, error) {
+func (e *Engine) lifecycle(ctx context.Context, req Request, loc *time.Location) (*Result, error) {
 	weekly := req.Period == "week"
 	periods := periodsBetween(span{req.From, req.To}, loc, weekly)
 	if len(periods) == 0 {
@@ -203,7 +204,7 @@ func (e *Engine) lifecycle(req Request, loc *time.Location) (*Result, error) {
 		pts[i].Label = label
 	}
 
-	err := e.eachVisitor(req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
+	err := e.eachVisitor(ctx, req.Site, span{req.From, req.To}, func(_ string, evs []seqEvent) {
 		active := make([]bool, len(periods))
 		any := false
 		for _, ev := range evs {

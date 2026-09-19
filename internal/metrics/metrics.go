@@ -48,6 +48,10 @@ type Metrics struct {
 	// liveness check on the compactor.
 	CompactionLagSeconds prometheus.Gauge
 
+	// UploadedBytes shows replication actually happening. A node whose uploads have silently
+	// stopped looks healthy in every other series while its local disk becomes the only copy.
+	UploadedBytes *prometheus.CounterVec
+
 	// HTTPRequests is the outermost signal, and the one that still works when the
 	// interesting internals are broken.
 	HTTPRequests *prometheus.CounterVec
@@ -86,6 +90,10 @@ func New(version string) *Metrics {
 			Name: "analytics_compaction_lag_seconds",
 			Help: "Age of the oldest event not yet written to Parquet: query freshness.",
 		}),
+		UploadedBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "analytics_uploaded_bytes_total",
+			Help: "Bytes replicated to object storage, by kind (wal, data, rollup).",
+		}, []string{"kind"}),
 		HTTPRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "analytics_http_requests_total",
 			Help: "HTTP requests by route and status class.",
@@ -93,7 +101,7 @@ func New(version string) *Metrics {
 	}
 
 	reg.MustRegister(m.BuildInfo, m.EventsReceived, m.WALSyncSeconds,
-		m.WALUnsyncedEvents, m.CompactionLagSeconds, m.HTTPRequests)
+		m.WALUnsyncedEvents, m.CompactionLagSeconds, m.UploadedBytes, m.HTTPRequests)
 
 	m.BuildInfo.WithLabelValues(version).Set(1)
 

@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -84,7 +85,7 @@ func TestOracleFunnel(t *testing.T) {
 	to := from.Add(96 * time.Hour)
 	const windowHours = 24
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetFunnel, Site: "s.example",
 		Steps: []string{"view", "add", "buy"}, WindowHours: windowHours,
 		From: from, To: to,
@@ -165,7 +166,7 @@ func TestOracleRetention(t *testing.T) {
 	from := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetRetention, Site: "s.example", Period: "day",
 		From: from, To: to, Timezone: "UTC",
 	})

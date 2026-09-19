@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -70,7 +71,7 @@ func TestISTDayBoundaryInsideASingleHour(t *testing.T) {
 
 	// The IST day of 2026-09-19.
 	istDayStart := time.Date(2026, 9, 19, 0, 0, 0, 0, loc)
-	res, err := e.Query(Request{
+	res, err := e.Query(context.Background(), Request{
 		Widget: WidgetTopPages, Site: "s.example",
 		From: istDayStart, To: istDayStart.AddDate(0, 0, 1),
 		Timezone: "Asia/Kolkata",
@@ -91,7 +92,7 @@ func TestISTDayBoundaryInsideASingleHour(t *testing.T) {
 
 	// And the following IST day must contain /b and nothing else.
 	next := istDayStart.AddDate(0, 0, 1)
-	res2, err := e.Query(Request{
+	res2, err := e.Query(context.Background(), Request{
 		Widget: WidgetTopPages, Site: "s.example",
 		From: next, To: next.AddDate(0, 0, 1), Timezone: "Asia/Kolkata",
 	})
@@ -117,7 +118,7 @@ func TestUTCAndISTDisagreeCorrectly(t *testing.T) {
 	e := New(dir)
 
 	utcDay := utc(2026, 9, 19, 0, 0)
-	res, err := e.Query(Request{
+	res, err := e.Query(context.Background(), Request{
 		Widget: WidgetTopPages, Site: "s.example",
 		From: utcDay, To: utcDay.Add(24 * time.Hour), Timezone: "UTC",
 	})
@@ -148,7 +149,7 @@ func TestTopPagesRanksAndLimits(t *testing.T) {
 	}
 
 	e := New(fixture(t, rows))
-	res, err := e.Query(Request{
+	res, err := e.Query(context.Background(), Request{
 		Widget: WidgetTopPages, Site: "s.example",
 		From: base.Add(-time.Hour), To: base.Add(2 * time.Hour), Limit: 2,
 	})
@@ -183,7 +184,7 @@ func TestPageviewsOverTimeBucketsByLocalDay(t *testing.T) {
 	e := New(fixture(t, rows))
 
 	start := time.Date(2026, 9, 19, 0, 0, 0, 0, loc)
-	res, err := e.Query(Request{
+	res, err := e.Query(context.Background(), Request{
 		Widget: WidgetPageviewsOverTime, Site: "s.example",
 		From: start, To: start.AddDate(0, 0, 3), Timezone: "Asia/Kolkata",
 	})
@@ -211,7 +212,7 @@ func TestTopReferrers(t *testing.T) {
 	rows[1].ReferrerHost = "facebook.com"
 
 	e := New(fixture(t, rows))
-	res, err := e.Query(Request{
+	res, err := e.Query(context.Background(), Request{
 		Widget: WidgetTopReferrers, Site: "s.example",
 		From: base.Add(-time.Hour), To: base.Add(time.Hour),
 	})
@@ -227,10 +228,10 @@ func TestUnknownWidgetAndMissingSite(t *testing.T) {
 	e := New(t.TempDir())
 	now := time.Now()
 
-	if _, err := e.Query(Request{Widget: "dropTable", Site: "s", From: now, To: now.Add(time.Hour)}); err == nil {
+	if _, err := e.Query(context.Background(), Request{Widget: "dropTable", Site: "s", From: now, To: now.Add(time.Hour)}); err == nil {
 		t.Error("an unknown widget was accepted; the fixed set is the read security model")
 	}
-	if _, err := e.Query(Request{Widget: WidgetTopPages, From: now, To: now.Add(time.Hour)}); err == nil {
+	if _, err := e.Query(context.Background(), Request{Widget: WidgetTopPages, From: now, To: now.Add(time.Hour)}); err == nil {
 		t.Error("a query without a site was accepted")
 	}
 }
@@ -241,7 +242,7 @@ func TestEmptySiteReturnsNoRows(t *testing.T) {
 	e := New(t.TempDir())
 	now := time.Now()
 
-	res, err := e.Query(Request{Widget: WidgetTopPages, Site: "nobody.example", From: now.Add(-time.Hour), To: now})
+	res, err := e.Query(context.Background(), Request{Widget: WidgetTopPages, Site: "nobody.example", From: now.Add(-time.Hour), To: now})
 	if err != nil {
 		t.Fatalf("querying an empty site errored: %v", err)
 	}

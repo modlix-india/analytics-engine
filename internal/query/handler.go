@@ -110,7 +110,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.Engine.Query(Request{
+	res, err := h.Engine.Query(r.Context(), Request{
 		Widget: req.Widget, Site: req.Site,
 		From: from, To: to, Timezone: req.Timezone,
 		Event: req.Event, Property: req.Property,

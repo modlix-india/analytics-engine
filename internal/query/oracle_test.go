@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -175,7 +176,7 @@ func TestOracleTopPages(t *testing.T) {
 	from := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	to := from.Add(14 * time.Hour)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetTopPages, Site: "s.example", From: from, To: to, Limit: 10,
 	})
 	if err != nil {
@@ -203,7 +204,7 @@ func TestOracleTopReferrers(t *testing.T) {
 	from := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	to := from.Add(14 * time.Hour)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetTopReferrers, Site: "s.example", From: from, To: to, Limit: 10,
 	})
 	if err != nil {
@@ -241,7 +242,7 @@ func TestOraclePageviewsOverTimeInIST(t *testing.T) {
 	from := time.Date(2026, 9, 19, 0, 0, 0, 0, loc)
 	to := from.AddDate(0, 0, 2)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetPageviewsOverTime, Site: "s.example",
 		From: from, To: to, Timezone: "Asia/Kolkata",
 	})
@@ -284,7 +285,7 @@ func TestOracleCustomEventBreakdown(t *testing.T) {
 	from := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	to := from.Add(14 * time.Hour)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetTopPages, Site: "s.example", Event: "cta_clicked",
 		From: from, To: to, Limit: 10,
 	})

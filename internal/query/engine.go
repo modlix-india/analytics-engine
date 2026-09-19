@@ -1,11 +1,17 @@
 package query
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/modlix-india/analytics-engine/internal/objstore"
 
 	"github.com/modlix-india/analytics-engine/internal/rollup"
 	"github.com/modlix-india/analytics-engine/internal/store"
@@ -135,11 +141,24 @@ type Result struct {
 
 type Engine struct {
 	DataDir string
+
+	// Remote, when set, is consulted for partitions that are not on local disk.
+	//
+	// This is what makes a node able to answer for history it never ingested: local retention
+	// prunes old Parquet, the bucket keeps it, and a query transparently reaches through. It
+	// is also why adding a node is a configuration change — the new one serves every site's
+	// past from the same bucket without any backfill.
+	Remote objstore.Store
+
+	// CacheDir holds files fetched from Remote. Defaults to DataDir/cache.
+	CacheDir string
+
+	Log *slog.Logger
 }
 
 func New(dataDir string) *Engine { return &Engine{DataDir: dataDir} }
 
-func (e *Engine) Query(req Request) (*Result, error) {
+func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 	if req.Site == "" {
 		return nil, fmt.Errorf("query: site is required")
 	}
@@ -167,32 +186,32 @@ func (e *Engine) Query(req Request) (*Result, error) {
 	// Both time series are the same code path; they differ only in which event they default
 	// to, so keeping two names is about the caller's vocabulary, not about behaviour.
 	if req.Widget == WidgetPageviewsOverTime || req.Widget == WidgetEventTimeline {
-		return e.overTime(req, loc)
+		return e.overTime(ctx, req, loc)
 	}
 	if dim, ok := breakdownDims[req.Widget]; ok {
-		return e.breakdown(req, dim)
+		return e.breakdown(ctx, req, dim)
 	}
 
 	switch req.Widget {
 	case WidgetFunnel:
-		return e.funnel(req, loc)
+		return e.funnel(ctx, req, loc)
 	case WidgetRetention:
-		return e.retention(req, loc)
+		return e.retention(ctx, req, loc)
 	case WidgetStickiness:
-		return e.stickiness(req, loc)
+		return e.stickiness(ctx, req, loc)
 	case WidgetLifecycle:
-		res, err := e.lifecycle(req, loc)
+		res, err := e.lifecycle(ctx, req, loc)
 		if err == nil {
 			res.RangeRelative = true
 		}
 		return res, err
 	case WidgetTopEvents:
-		return e.topEvents(req)
+		return e.topEvents(ctx, req)
 	case WidgetBreakdownByProperty:
 		if !propertyDims[req.Property] {
 			return nil, fmt.Errorf("query: %q is not a dimension this engine breaks down by", req.Property)
 		}
-		return e.breakdown(req, req.Property)
+		return e.breakdown(ctx, req, req.Property)
 	default:
 		return nil, fmt.Errorf("query: unknown widget %q", req.Widget)
 	}
@@ -203,8 +222,8 @@ func (e *Engine) Query(req Request) (*Result, error) {
 // It reads the same DimNone rows every other widget uses for totals, but merges them keyed by
 // event name instead of by dimension value. Remapping Key and reusing MergeByKey keeps one
 // merge implementation rather than two that could drift.
-func (e *Engine) topEvents(req Request) (*Result, error) {
-	rows, rawHours, err := e.collect(req.Site, allEvents, rollup.DimNone, span{req.From, req.To})
+func (e *Engine) topEvents(ctx context.Context, req Request) (*Result, error) {
+	rows, rawHours, err := e.collect(ctx, req.Site, allEvents, rollup.DimNone, span{req.From, req.To})
 	if err != nil {
 		return nil, err
 	}
@@ -234,11 +253,11 @@ func (e *Engine) topEvents(req Request) (*Result, error) {
 //
 // Each day is planned separately, because each has its own boundary hours — and its own
 // length, since a DST day is 23 or 25 hours.
-func (e *Engine) overTime(req Request, loc *time.Location) (*Result, error) {
+func (e *Engine) overTime(ctx context.Context, req Request, loc *time.Location) (*Result, error) {
 	res := &Result{Widget: req.Widget, Site: req.Site, VisitorsApproximate: true}
 
 	for _, day := range daySpans(span{req.From, req.To}, loc) {
-		merged, rawHours, err := e.aggregate(req.Site, req.Event, rollup.DimNone, day)
+		merged, rawHours, err := e.aggregate(ctx, req.Site, req.Event, rollup.DimNone, day)
 		if err != nil {
 			return nil, err
 		}
@@ -256,8 +275,8 @@ func (e *Engine) overTime(req Request, loc *time.Location) (*Result, error) {
 }
 
 // breakdown produces top-N rows for one dimension over the whole range.
-func (e *Engine) breakdown(req Request, dim string) (*Result, error) {
-	merged, rawHours, err := e.aggregate(req.Site, req.Event, dim, span{req.From, req.To})
+func (e *Engine) breakdown(ctx context.Context, req Request, dim string) (*Result, error) {
+	merged, rawHours, err := e.aggregate(ctx, req.Site, req.Event, dim, span{req.From, req.To})
 	if err != nil {
 		return nil, err
 	}
@@ -277,8 +296,8 @@ func (e *Engine) breakdown(req Request, dim string) (*Result, error) {
 
 // aggregate is where the two tiers meet: whole hours from rollups, boundary remainders from
 // raw. Callers never see the seam.
-func (e *Engine) aggregate(site, event, dim string, s span) ([]rollup.Merged, int, error) {
-	rows, rawHours, err := e.collect(site, event, dim, s)
+func (e *Engine) aggregate(ctx context.Context, site, event, dim string, s span) ([]rollup.Merged, int, error) {
+	rows, rawHours, err := e.collect(ctx, site, event, dim, s)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -293,7 +312,7 @@ const allEvents = "\x00all"
 
 // collect gathers the rollup rows matching a query, correcting the partial boundary hours from
 // raw data. It stops short of merging so a caller can re-key first.
-func (e *Engine) collect(site, event, dim string, s span) ([]rollup.Row, int, error) {
+func (e *Engine) collect(ctx context.Context, site, event, dim string, s span) ([]rollup.Row, int, error) {
 	plan := planHours(s)
 
 	hours := make(map[int64]bool, len(plan.FullHours))
@@ -303,7 +322,7 @@ func (e *Engine) collect(site, event, dim string, s span) ([]rollup.Row, int, er
 
 	var rows []rollup.Row
 	for _, date := range utcDates(s) {
-		files, err := e.filesIn("rollup", site, date)
+		files, err := e.filesIn(ctx, "rollup", site, date)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -325,7 +344,7 @@ func (e *Engine) collect(site, event, dim string, s span) ([]rollup.Row, int, er
 	// merge below sees one uniform input, which keeps the correction from becoming a second
 	// code path that could disagree with the first.
 	for _, part := range plan.Partials {
-		raw, err := e.rawRows(site, part)
+		raw, err := e.rawRows(ctx, site, part)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -346,10 +365,10 @@ func (e *Engine) collect(site, event, dim string, s span) ([]rollup.Row, int, er
 	return rows, len(plan.Partials), nil
 }
 
-func (e *Engine) rawRows(site string, s span) ([]store.Row, error) {
+func (e *Engine) rawRows(ctx context.Context, site string, s span) ([]store.Row, error) {
 	var out []store.Row
 	for _, date := range utcDates(s) {
-		files, err := e.filesIn("data", site, date)
+		files, err := e.filesIn(ctx, "data", site, date)
 		if err != nil {
 			return nil, err
 		}
@@ -364,27 +383,116 @@ func (e *Engine) rawRows(site string, s span) ([]store.Row, error) {
 	return out, nil
 }
 
-// filesIn lists one partition directory.
+// filesIn lists one partition, from local disk and, where configured, from object storage.
 //
-// A missing directory is not an error: a site with no traffic on a date simply has none, and
-// that is the common case at the edges of every range.
-func (e *Engine) filesIn(tier, site, date string) ([]string, error) {
-	dir := filepath.Join(e.DataDir, tier, store.SafeSegment(site), store.SafeSegment(date))
+// A missing local directory is not an error: a site with no traffic on a date simply has none,
+// and that is what every range edge looks like. Nor is it evidence the data does not exist —
+// local retention prunes old partitions while the bucket keeps them, so the remote listing is
+// consulted whenever a store is configured.
+func (e *Engine) filesIn(ctx context.Context, tier, site, date string) ([]string, error) {
+	safeSite, safeDate := store.SafeSegment(site), store.SafeSegment(date)
+	dir := filepath.Join(e.DataDir, tier, safeSite, safeDate)
 
-	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	out, have, err := listParquet(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	var out []string
-	for _, ent := range entries {
-		if !ent.IsDir() && filepath.Ext(ent.Name()) == ".parquet" {
-			out = append(out, filepath.Join(dir, ent.Name()))
-		}
+	if e.Remote == nil {
+		sort.Strings(out)
+		return out, nil
 	}
+
+	prefix := tier + "/" + safeSite + "/" + safeDate + "/"
+	objs, err := e.Remote.List(ctx, prefix)
+	if err != nil {
+		// A bucket that is briefly unreachable should degrade to whatever is local rather
+		// than failing the query outright — partial data with a warning beats none.
+		if e.Log != nil {
+			e.Log.Warn("query: listing object storage failed; answering from local data only",
+				"prefix", prefix, "err", err)
+		}
+		sort.Strings(out)
+		return out, nil
+	}
+
+	for _, o := range objs {
+		base := path.Base(o.Key)
+		if have[base] {
+			continue
+		}
+		cached, err := e.fetch(ctx, o.Key, tier, safeSite, safeDate, base)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cached)
+	}
+
 	sort.Strings(out)
 	return out, nil
+}
+
+// fetch downloads one object into the local cache, if it is not already there.
+//
+// Written to a temporary name and renamed, for the same reason compaction does: two queries
+// can want the same cold partition at once, and a reader must never open a half-written file.
+func (e *Engine) fetch(ctx context.Context, key, tier, site, date, base string) (string, error) {
+	cacheDir := e.CacheDir
+	if cacheDir == "" {
+		cacheDir = filepath.Join(e.DataDir, "cache")
+	}
+	dir := filepath.Join(cacheDir, tier, site, date)
+	dst := filepath.Join(dir, base)
+
+	if _, err := os.Stat(dst); err == nil {
+		return dst, nil
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", err
+	}
+
+	rc, err := e.Remote.Get(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", key, err)
+	}
+	defer rc.Close()
+
+	tmp, err := os.CreateTemp(dir, ".fetch-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := io.Copy(tmp, rc); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp.Name(), dst); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+func listParquet(dir string) ([]string, map[string]bool, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var out []string
+	have := map[string]bool{}
+	for _, ent := range entries {
+		if ent.IsDir() || filepath.Ext(ent.Name()) != ".parquet" {
+			continue
+		}
+		have[ent.Name()] = true
+		out = append(out, filepath.Join(dir, ent.Name()))
+	}
+	return out, have, nil
 }

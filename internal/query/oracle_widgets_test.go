@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestOracleAllBreakdowns(t *testing.T) {
 		{WidgetPlatformBreakdown, "platform"},
 	} {
 		t.Run(tc.widget, func(t *testing.T) {
-			got, err := eng.Query(Request{
+			got, err := eng.Query(context.Background(), Request{
 				Widget: tc.widget, Site: "s.example", From: from, To: to, Limit: 20,
 			})
 			if err != nil {
@@ -63,7 +64,7 @@ func TestOracleTopEvents(t *testing.T) {
 	from := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	to := from.Add(14 * time.Hour)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetTopEvents, Site: "s.example", From: from, To: to, Limit: 20,
 	})
 	if err != nil {
@@ -87,7 +88,7 @@ func TestOracleEventTimeline(t *testing.T) {
 	from := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	to := from.Add(14 * time.Hour)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetEventTimeline, Site: "s.example", Event: "cta_clicked",
 		From: from, To: to, Timezone: "UTC",
 	})
@@ -120,7 +121,7 @@ func TestOracleBreakdownByProperty(t *testing.T) {
 	from := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	to := from.Add(14 * time.Hour)
 
-	got, err := New(dir).Query(Request{
+	got, err := New(dir).Query(context.Background(), Request{
 		Widget: WidgetBreakdownByProperty, Site: "s.example", Property: "browser",
 		From: from, To: to, Limit: 20,
 	})
@@ -145,7 +146,7 @@ func TestBreakdownByPropertyRefusesUnknownDimensions(t *testing.T) {
 	now := time.Now()
 
 	for _, prop := range []string{"visitor", "session", "props", "site", "", "../etc"} {
-		_, err := e.Query(Request{
+		_, err := e.Query(context.Background(), Request{
 			Widget: WidgetBreakdownByProperty, Site: "s.example", Property: prop,
 			From: now.Add(-time.Hour), To: now,
 		})
@@ -155,7 +156,7 @@ func TestBreakdownByPropertyRefusesUnknownDimensions(t *testing.T) {
 	}
 
 	// And an allow-listed one is accepted.
-	if _, err := e.Query(Request{
+	if _, err := e.Query(context.Background(), Request{
 		Widget: WidgetBreakdownByProperty, Site: "s.example", Property: "country",
 		From: now.Add(-time.Hour), To: now,
 	}); err != nil {
