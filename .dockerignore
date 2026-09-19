@@ -1,0 +1,7 @@
+# Keep the build context to source. data/ in particular can be large, and copying it would both
+# slow the build and risk baking events into an image.
+data/
+.git/
+*.md
+Dockerfile
+.dockerignore
