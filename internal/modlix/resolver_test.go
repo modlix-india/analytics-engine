@@ -37,7 +37,10 @@ func fakeSecurity(t *testing.T, hosts map[string][2]string, delay time.Duration)
 
 func newResolver(t *testing.T, sec *Security) *Resolver {
 	t.Helper()
-	r := &Resolver{Security: sec, Shared: NewMemoryShared(), Budget: 2 * time.Second}
+	r := &Resolver{
+		Security: sec, Shared: NewMemoryShared(), Budget: 2 * time.Second,
+		PathHosts: map[string]bool{"apps.dev.modlix.com": true},
+	}
 	r.Start(context.Background())
 	return r
 }
@@ -234,5 +237,39 @@ func TestNoHostIsDiscarded(t *testing.T) {
 
 	if _, ok := r.Resolve(context.Background(), ingest.Signals{UserAgent: "curl/8.0"}); ok {
 		t.Fatal("a request with no host at all resolved to a site")
+	}
+}
+
+// The path form is only believed on the platform's own shared hosts.
+//
+// The Origin check alone does not protect it: a page always agrees with its own Origin, so
+// any site could otherwise name any app by putting it in its own URL. This is the test that
+// says so out loud, because the hole is invisible — the forged request looks exactly like a
+// legitimate one from apps.dev.modlix.com.
+func TestPathFormIsRefusedOnAHostWeDoNotServeAppsFrom(t *testing.T) {
+	sec, _ := fakeSecurity(t, nil, 0)
+	r := newResolver(t, sec)
+
+	got, ok := r.Resolve(context.Background(), ingest.Signals{
+		PageURL: "https://attacker.example/victimapp/VICTIM/page/home",
+		Origin:  "https://attacker.example",
+	})
+
+	if ok {
+		t.Fatalf("a path on someone else's host resolved to %q", got.Site)
+	}
+}
+
+// And with no list configured at all, the path form is off entirely rather than open.
+func TestPathFormIsOffWhenNoHostsAreConfigured(t *testing.T) {
+	sec, _ := fakeSecurity(t, nil, 0)
+	r := &Resolver{Security: sec, Shared: NewMemoryShared(), Budget: 2 * time.Second}
+	r.Start(context.Background())
+
+	if _, ok := r.Resolve(context.Background(), ingest.Signals{
+		PageURL: "https://apps.dev.modlix.com/monkbars/SYSTEM/page/home",
+		Origin:  "https://apps.dev.modlix.com",
+	}); ok {
+		t.Fatal("the path form was believed with no ANALYTICS_PATH_HOSTS configured")
 	}
 }

@@ -43,6 +43,7 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 | `ANALYTICS_SECURITY_URL` | — | set to enable the Modlix site resolver; the host is the site otherwise |
 | `ANALYTICS_RESOLVE_BUDGET` | `250ms` | longest ingest waits for a site lookup before dropping the event |
 | `ANALYTICS_RESOLVE_TTL` / `_NEGATIVE_TTL` | `5m` / `1m` | how long a resolution, and a non-resolution, are kept |
+| `ANALYTICS_PATH_HOSTS` | — | hosts where a path-prefixed URL may name the site; empty disables the path form |
 | `ANALYTICS_REDIS_ADDR` / `_PASSWORD` / `_DB` | — | shares resolutions across nodes and receives cache evictions |
 | `ANALYTICS_REDIS_PREFIX` | `cmn` | must match `redis.cache.prefix` on the Java side |
 | `ANALYTICS_LOCAL_RETENTION` | `0` (keep) | how long Parquet stays on local disk after upload |
@@ -54,9 +55,37 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 |---|---|
 | `GET /healthz` | the process is alive. Checks nothing else on purpose: a liveness probe that fails on a dependency restarts a process that would have recovered |
 | `GET /readyz` | this node can accept writes |
+| `GET /a.js` | the browser beacon, served by the engine that receives its events |
 | `POST /i` | ingest a batch — public, write-only, answers 204 either way |
 | `POST /q` | run one of the fixed widgets — see below |
 | `GET /metrics` | Prometheus |
+
+## The beacon
+
+```html
+<script>window.mlx=window.mlx||function(){(window.mlx.q=window.mlx.q||[]).push(arguments)};</script>
+<script async src="https://analytics.example/a.js"
+        data-autocapture="true" data-pageviews="true"
+        data-pageleaves="true" data-consent="required"></script>
+```
+
+The engine serves its own client, so a page-generating service needs one tag and no knowledge
+of the wire format, and the two cannot drift apart across a deployment. The endpoint is the
+tag's own `src`; options are data attributes. The queue stub means an event fired before the
+async script arrives is held rather than lost.
+
+```js
+mlx('capture', 'checkout_started', {plan: 'pro'})
+mlx('page', 'checkoutPage')       // the host application's page identity
+mlx('experiment', 'pricing', 'b')
+mlx('consent', true)              // false revokes and stops everything
+```
+
+It sends a session id and no visitor id: the engine derives the visitor from a daily-rotating
+salt, so there is no durable identifier in the page. Page views follow SPA navigation.
+Autocapture is **only** elements carrying `data-analytics-label` — deliberately narrower than
+capturing every click and naming it from the DOM, because those names change with the markup
+and the text of a clicked element can carry someone's own data into an event name.
 
 ## Ingesting
 
@@ -244,6 +273,11 @@ Setting `ANALYTICS_SECURITY_URL` turns on the Modlix resolver, which answers wit
    its events under any tenant it named.
 3. **The hostname**, through the same security endpoint the gateway uses, so the two cannot
    disagree about which app a host belongs to.
+
+The path form needs `ANALYTICS_PATH_HOSTS` to list the hosts it may be believed on, and the
+`Origin` check alone is not enough to make it safe: a page always agrees with its own Origin,
+so without that list any site could name any app by putting it in its own URL. Empty — the
+default — disables the path form entirely.
 
 An unrecognised host is discarded, and remembered as unrecognised — that is the common case
 on a public endpoint, not an error. `analytics_sites_resolved_total` carries which path each

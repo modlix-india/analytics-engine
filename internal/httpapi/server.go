@@ -44,6 +44,10 @@ type Options struct {
 
 	// Query handles POST /q. Nil leaves it unregistered, for an ingest-only node.
 	Query http.Handler
+
+	// SDK serves the browser beacon at /a.js. Nil leaves it unregistered, which is right
+	// for a node that only ever receives server-side events.
+	SDK http.Handler
 }
 
 func New(o Options) *Server {
@@ -55,7 +59,16 @@ func New(o Options) *Server {
 	mux.Handle("GET /metrics", o.Metrics.Handler())
 
 	if o.Ingest != nil {
-		mux.Handle("POST /i", s.instrument("ingest", o.Ingest))
+		mux.Handle("POST /i", s.instrument("ingest", cors(o.Ingest)))
+		// The browser asks before it posts whenever the request is not a "simple" one.
+		// The beacon avoids that by sending text/plain, but anything else integrating
+		// against this endpoint will preflight, and a 405 there looks like the engine
+		// being down rather than like a missing header.
+		mux.Handle("OPTIONS /i", s.instrument("ingest", http.HandlerFunc(preflight)))
+	}
+	if o.SDK != nil {
+		mux.Handle("GET /a.js", s.instrument("sdk", o.SDK))
+		mux.Handle("HEAD /a.js", s.instrument("sdk", o.SDK))
 	}
 	if o.Query != nil {
 		mux.Handle("POST /q", s.instrument("query", o.Query))
@@ -137,6 +150,35 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+// cors makes the ingest endpoint reachable from a page on another origin, which is every
+// page: the analytics host is never the site's own host.
+//
+// The Origin is echoed rather than answered with "*" so that the header is accurate about
+// who asked, and credentials are never allowed — this endpoint must not see a cookie. It is
+// not an access control either way: ingest is public by design, and a browser's same-origin
+// policy was never what protected it.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func preflight(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Encoding")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // instrument records the outcome of a route by status class.

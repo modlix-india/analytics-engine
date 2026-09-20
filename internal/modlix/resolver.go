@@ -32,6 +32,17 @@ type Resolver struct {
 	// layer no eviction message reaches if Redis is absent.
 	LocalTTL time.Duration
 
+	// PathHosts are the hosts on which a path-prefixed URL may name the site — the platform's
+	// own shared hosts, `apps.dev.modlix.com` and its siblings.
+	//
+	// Without this list the path form is an open door, and the Origin check does not close
+	// it: a page always agrees with its own Origin, so attacker.example/victimapp/VICTIM/page/
+	// would resolve to the victim's site and write into their numbers. Requiring the host to
+	// be one of ours means a path prefix is only believed where the platform actually serves
+	// apps that way. Empty disables the path form entirely, which is the right default for a
+	// deployment that has not thought about it.
+	PathHosts map[string]bool
+
 	// NegativeTTL is how long an unrecognised host is remembered as unrecognised. Its own
 	// setting because the two are different risks: caching a real site too long delays a
 	// customer's first numbers, caching an unknown host too briefly lets a scanner drive
@@ -126,12 +137,15 @@ func (r *Resolver) Resolve(ctx context.Context, s ingest.Signals) (ingest.Resolu
 		}, true
 	}
 
-	// 2. A path-prefixed page URL, which is how every app without a custom domain is
-	// served. Trusted only as far as the browser-set Origin agrees with it: the page URL
-	// travels in the payload, so a script could otherwise name any app it liked and write
-	// into another tenant's numbers. Where Origin is absent the host still has to resolve
-	// on its own below.
-	if app, client, ok := codesFromPath(s.PageURL); ok && originAgrees(s.PageURL, s.Origin) {
+	// 2. A path-prefixed page URL, which is how every app without a custom domain is served.
+	//
+	// Two conditions, and both are load-bearing. The browser-set Origin must agree with the
+	// page URL, because the page URL travels in the payload and a script could otherwise
+	// claim to be anywhere. And the host must be one of the platform's own shared hosts,
+	// because a page always agrees with its own Origin — without that list, any site could
+	// name any app by putting it in its own path.
+	if app, client, ok := codesFromPath(s.PageURL); ok && originAgrees(s.PageURL, s.Origin) &&
+		r.PathHosts[hostOf(s.PageURL)] {
 		r.count("path")
 		return ingest.Resolution{Site: SiteKey(client, app)}, true
 	}

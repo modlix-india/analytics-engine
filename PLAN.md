@@ -894,8 +894,68 @@ Each ends in something runnable.
     Lookup failures are never cached: security being unreachable says nothing about the host,
     and remembering it as unknown would bin a real customer's events after the outage ended.
 11. **Modlix integration** — SDK, `AnalyticsService` retarget, delete the rewriter, replace
-    the Workers.
+    the Workers. *(done, except the Workers)*
+
+    Proven end to end on the local stack, in a real browser: a page loads the beacon over
+    https from `analytics.local.modlix.com`, fires a page view, a labelled click and a custom
+    event with properties, and all three arrive in one batch. The engine resolves the site
+    from the path form, stores `$pageview` / `click` / `checkout_started` under
+    `modlix_SYSTEM`, and `POST /api/ui/analytics/query` answers them through `ui` with the
+    caller authorised and the site forced.
+
+    **The engine serves its own beacon** at `/a.js`. The previous arrangement transcribed the
+    vendor's minified stub into `IndexHTMLService.java` and again into `htmlRenderer.ts`, and
+    the two copies had begun to drift; both now emit one script tag. Ingest also grew CORS,
+    which it had never needed while the only client was the vendor's own domain.
+
+    **`HogQLTenantRewriter` is deleted, not ported.** With a closed widget set there is no
+    expression to rewrite and nothing to sanitise. What `ui` still does is the part the
+    engine cannot know: who may read a site, and which day boundary the numbers use.
+
+    **A hole in milestone 10's path form, found by trying to test it.** The `Origin` check
+    stops a script claiming to be on another host, but a page always agrees with its OWN
+    Origin — so `attacker.example/victimapp/VICTIM/page/` would have resolved to the victim's
+    site. The path form now also requires the host to be one of `ANALYTICS_PATH_HOSTS`, and
+    an empty list disables it rather than opening it. It took building the test page to see
+    it: the forged request is indistinguishable from a legitimate one until you ask which
+    host it came from.
+
+    **A defect inherited from the old service, now fixed.** Every error it raised passed a
+    literal English sentence where `throwMessage` expects a message-bundle key, so every 400,
+    403 and 503 the analytics proxy has ever returned rendered as "Internal Server Error
+    (Unknown)". Six keys added; the bad-timezone path now answers "Mars/Olympus is not a
+    known IANA time zone."
+
+    Behaviour that deliberately did not survive the port: no user identification (visitors are
+    anonymous by construction, so there is no profile to attach a name to), no app/client
+    super properties from the page (the engine resolves the site itself), no monthly retention
+    cohort, and retention no longer separates a target event from a returning event.
+
+    Left for milestone 12: the `SessionReplay*` components, the Cloudflare Workers, the
+    `oci-config` deployment settings, and the PostHog stacks themselves.
 12. **Retire PostHog** — the inventory in section 10, all three environments together.
+    *(repo side done; the deployed side is waiting on a decision and an approval)*
+
+    Removed: the `SessionReplay*` components and their catalog entries, the component-book
+    entries, the two docs pages and their tree entries, the PostHog prose in the agent's
+    component guidance and analytics-label reference, and the vendor's name from the UIEngine
+    function catalog the agent reads. The Cloudflare Worker now proxies `/a.js` and `/i` to an
+    `ENGINE_ORIGIN` and 404s everything else — `/q` deliberately among them, because a request
+    arriving from a browser has no shared secret and no business asking.
+
+    `platform/services/analytics` is rewritten around the widget API, the timezone chain and
+    the fact that visitors are anonymous by construction.
+
+    **Not done, deliberately: the three environment ymls and the VM stacks.** Retiring those
+    before the engine is deployed would take ingest down in dev, stage and prod — the pages
+    would carry a beacon pointing at a host that no longer answers. The order has to be:
+    deploy the engine, repoint the Worker, then stop PostHog.
+
+    **And one question that has to be answered first: where the engine runs.** It needs the
+    security service's internal endpoint and the platform's Redis (for the eviction channel
+    it listens on). The analytics VMs are separate from the app VMs, so either the engine
+    moves onto the app VMs or those two paths are opened to it. That decision changes what
+    the deployment stack looks like, so no stack has been written on a guess.
 13. **Paths** — sequence to edge counts, with step and branching caps.
 14. **Correlation** — contingency tables, chi-squared with a Fisher fallback, Benjamini-Hochberg.
     Last of the analyses because it depends on the funnel and is the one that can be

@@ -101,6 +101,14 @@ type Config struct {
 	// gateway, whose `(.*internal.*)` rule does not do what its name suggests.
 	SecurityURL string
 
+	// PathHosts are the hosts on which a path-prefixed URL (/appCode/clientCode/page/...) is
+	// allowed to name the site: the platform's own shared hosts. Comma-separated.
+	//
+	// Empty disables the path form, which is the safe default — a page always agrees with
+	// its own Origin, so without a list of hosts we actually serve apps from, any site could
+	// name any app by putting it in its own URL.
+	PathHosts []string
+
 	// ResolveBudget is the longest ingest will wait for a site lookup before dropping the
 	// event. Small on purpose: the WAL append must never queue behind a dependency, and a
 	// dropped pageview costs a rounding error where a stalled ingest path costs an outage.
@@ -174,6 +182,7 @@ func Load() (Config, error) {
 		RemoteRetention:   envDur("ANALYTICS_REMOTE_RETENTION", 0),
 
 		SecurityURL:        envStr("ANALYTICS_SECURITY_URL", ""),
+		PathHosts:          envList("ANALYTICS_PATH_HOSTS"),
 		ResolveBudget:      envDur("ANALYTICS_RESOLVE_BUDGET", 250*time.Millisecond),
 		ResolveTTL:         envDur("ANALYTICS_RESOLVE_TTL", 5*time.Minute),
 		ResolveNegativeTTL: envDur("ANALYTICS_RESOLVE_NEGATIVE_TTL", time.Minute),
@@ -280,4 +289,20 @@ func envDur(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return v
+}
+
+// envList reads a comma-separated list, discarding blanks and surrounding space so that a
+// value pasted across lines in a compose file behaves the way it looks.
+func envList(key string) []string {
+	raw := os.Getenv(key)
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.ToLower(strings.TrimSpace(part)); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

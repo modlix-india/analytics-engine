@@ -29,6 +29,7 @@ import (
 	"github.com/modlix-india/analytics-engine/internal/objstore"
 	"github.com/modlix-india/analytics-engine/internal/query"
 	"github.com/modlix-india/analytics-engine/internal/replicate"
+	"github.com/modlix-india/analytics-engine/internal/sdk"
 	"github.com/modlix-india/analytics-engine/internal/wal"
 )
 
@@ -111,9 +112,19 @@ func run() error {
 	// appCode_clientCode. The engine itself learns neither vocabulary.
 	var resolver ingest.SiteResolver = ingest.HostResolver{}
 	if cfg.SecurityURL != "" {
+		pathHosts := map[string]bool{}
+		for _, h := range cfg.PathHosts {
+			pathHosts[h] = true
+		}
+		if len(pathHosts) == 0 {
+			log.Warn("no ANALYTICS_PATH_HOSTS: apps served from a shared host with a path prefix " +
+				"will not be measured, because a path prefix cannot be believed without one")
+		}
+
 		mr := &modlix.Resolver{
 			Security:    modlix.NewSecurity(cfg.SecurityURL, 5*time.Second),
 			Shared:      sharedCache(cfg, log),
+			PathHosts:   pathHosts,
 			Log:         log,
 			LocalTTL:    cfg.ResolveTTL,
 			NegativeTTL: cfg.ResolveNegativeTTL,
@@ -124,7 +135,8 @@ func run() error {
 		// reaches this node without waiting out a TTL.
 		mr.Start(ctx)
 		resolver = mr
-		log.Info("modlix resolver enabled", "security", cfg.SecurityURL, "redis", cfg.RedisAddr != "")
+		log.Info("modlix resolver enabled", "security", cfg.SecurityURL, "redis", cfg.RedisAddr != "",
+			"path_hosts", cfg.PathHosts)
 	}
 
 	ing := ingest.New(ingest.Options{
@@ -208,6 +220,7 @@ func run() error {
 		Log:     log,
 		Metrics: m,
 		Ingest:  ing.Handle,
+		SDK:     sdk.Handler(),
 		Query: &query.Handler{
 			Engine: &query.Engine{
 				DataDir: cfg.DataDir, Remote: remote, Log: log,
