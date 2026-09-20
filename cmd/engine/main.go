@@ -19,10 +19,13 @@ import (
 	"time"
 
 	"github.com/modlix-india/analytics-engine/internal/compact"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/modlix-india/analytics-engine/internal/config"
 	"github.com/modlix-india/analytics-engine/internal/httpapi"
 	"github.com/modlix-india/analytics-engine/internal/ingest"
 	"github.com/modlix-india/analytics-engine/internal/metrics"
+	"github.com/modlix-india/analytics-engine/internal/modlix"
 	"github.com/modlix-india/analytics-engine/internal/objstore"
 	"github.com/modlix-india/analytics-engine/internal/query"
 	"github.com/modlix-india/analytics-engine/internal/replicate"
@@ -64,6 +67,23 @@ func run() error {
 
 	m := metrics.New(version)
 
+	// SIGTERM is what a container orchestrator sends, SIGINT what a terminal sends. Both mean
+	// the same thing here: stop taking work and finish what is in hand.
+	//
+	// Created before anything that runs in the background, because each of those has to be
+	// given a context that a shutdown actually reaches.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// A cancel of our own, on top of the signal context. Everything below can return an
+	// error, and the background loops started below are waited on by deferred receives. A
+	// deferred `stop()` is registered first and therefore runs LAST, so without this a
+	// startup failure would block forever on loops nobody had told to stop: the process
+	// exits only when someone kills it, and a supervisor sees a running engine that is
+	// serving nothing. Measured: a port conflict hung for 180s and was still going.
+	ctx, stopLoops := context.WithCancel(sigCtx)
+	defer stopLoops()
+
 	w, err := wal.Open(wal.Options{
 		Dir:          filepath.Join(cfg.DataDir, "wal"),
 		SegmentBytes: cfg.WALSegmentBytes,
@@ -86,11 +106,30 @@ func run() error {
 		}
 	}()
 
+	// The identity resolver is the default: the host is the site. Configuring a security
+	// service swaps in the Modlix one, which maps hosts and path-prefixed URLs onto
+	// appCode_clientCode. The engine itself learns neither vocabulary.
+	var resolver ingest.SiteResolver = ingest.HostResolver{}
+	if cfg.SecurityURL != "" {
+		mr := &modlix.Resolver{
+			Security:    modlix.NewSecurity(cfg.SecurityURL, 5*time.Second),
+			Shared:      sharedCache(cfg, log),
+			Log:         log,
+			LocalTTL:    cfg.ResolveTTL,
+			NegativeTTL: cfg.ResolveNegativeTTL,
+			Budget:      cfg.ResolveBudget,
+			OnResolve:   func(outcome string) { m.SitesResolved.WithLabelValues(outcome).Inc() },
+		}
+		// Subscribes to the platform's eviction announcements, so a changed client URL
+		// reaches this node without waiting out a TTL.
+		mr.Start(ctx)
+		resolver = mr
+		log.Info("modlix resolver enabled", "security", cfg.SecurityURL, "redis", cfg.RedisAddr != "")
+	}
+
 	ing := ingest.New(ingest.Options{
-		Sink: w,
-		// The identity resolver: the host is the site. An embedder replaces this with one
-		// that maps hosts onto its own tenancy, without that vocabulary reaching this repo.
-		Resolver:       ingest.HostResolver{},
+		Sink:           w,
+		Resolver:       resolver,
 		Log:            log,
 		MaxBatchEvents: cfg.MaxBatchEvents,
 		MaxBodyBytes:   cfg.MaxBodyBytes,
@@ -98,20 +137,6 @@ func run() error {
 			m.EventsReceived.WithLabelValues(outcome).Inc()
 		},
 	})
-
-	// SIGTERM is what a container orchestrator sends, SIGINT what a terminal sends. Both mean
-	// the same thing here: stop taking work and finish what is in hand.
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// A cancel of our own, on top of the signal context. Everything below can return an
-	// error, and the background loops started below are waited on by deferred receives. A
-	// deferred `stop()` is registered first and therefore runs LAST, so without this a
-	// startup failure would block forever on loops nobody had told to stop: the process
-	// exits only when someone kills it, and a supervisor sees a running engine that is
-	// serving nothing. Measured: a port conflict hung for 180s and was still going.
-	ctx, stopLoops := context.WithCancel(sigCtx)
-	defer stopLoops()
 
 	// Object storage is optional. Without it everything stays local, which is correct for
 	// development and for a single node with its own backups.
@@ -184,8 +209,11 @@ func run() error {
 		Metrics: m,
 		Ingest:  ing.Handle,
 		Query: &query.Handler{
-			Engine: &query.Engine{DataDir: cfg.DataDir, Remote: remote, Log: log},
-			Auth:   auth, Log: log,
+			Engine: &query.Engine{
+				DataDir: cfg.DataDir, Remote: remote, Log: log,
+				DefaultTimezone: cfg.DefaultTimezone,
+			},
+			Auth: auth, Log: log,
 		},
 		// A node whose disk has stopped accepting writes is alive but must not be sent
 		// traffic. Reporting the WAL's last sync error is what takes it out of rotation
@@ -199,6 +227,30 @@ func run() error {
 
 	log.Info("stopped")
 	return nil
+}
+
+// sharedCache is the resolver's cross-node cache.
+//
+// Without Redis each node keeps its own in-process one: correct, and fine for a single node,
+// but it resolves every host once per node and hears none of the platform's eviction
+// announcements. That is a fleet-size decision rather than a correctness one, so it is a
+// missing variable rather than a refusal — said out loud at boot, because the failure it
+// leads to (one node serving stale sites after a URL change) is hard to attribute later.
+func sharedCache(cfg config.Config, log *slog.Logger) modlix.Shared {
+	if cfg.RedisAddr == "" {
+		log.Warn("no ANALYTICS_REDIS_ADDR: site resolutions are cached per node and no eviction reaches them")
+		return modlix.NewMemoryShared()
+	}
+	return &modlix.RedisShared{
+		Client: redis.NewClient(&redis.Options{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPassword,
+			DB:       cfg.RedisDB,
+		}),
+		Prefix: cfg.RedisPrefix,
+		TTL:    cfg.ResolveTTL,
+		Log:    log,
+	}
 }
 
 func newLogger(level string) *slog.Logger {

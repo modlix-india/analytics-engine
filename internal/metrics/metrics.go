@@ -32,6 +32,14 @@ type Metrics struct {
 	// every customer — and an unbounded label is how a metrics endpoint becomes the outage.
 	EventsReceived *prometheus.CounterVec
 
+	// SitesResolved counts resolutions by how the site was determined, or why it was not:
+	// ua_tag, path, local_hit, shared_hit, lookup, unknown_host, timeout, lookup_error.
+	//
+	// The reason this is worth a metric of its own is that most of those outcomes are
+	// indistinguishable from the outside — a site with no traffic and a site whose host
+	// stopped resolving look identical on a dashboard. Here they do not.
+	SitesResolved *prometheus.CounterVec
+
 	// WALSyncSeconds is the group-commit fsync. When ingest latency rises this says
 	// immediately whether the disk is the reason, which is the first fork in that
 	// investigation.
@@ -75,6 +83,10 @@ func New(version string) *Metrics {
 			Name: "analytics_events_received_total",
 			Help: "Events by outcome: accepted, or the reason they were discarded.",
 		}, []string{"outcome"}),
+		SitesResolved: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "analytics_sites_resolved_total",
+			Help: "Site resolutions by how they were resolved, or why they were not.",
+		}, []string{"outcome"}),
 		WALSyncSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "analytics_wal_sync_seconds",
 			Help: "Duration of a group-commit fsync.",
@@ -100,7 +112,7 @@ func New(version string) *Metrics {
 		}, []string{"route", "status"}),
 	}
 
-	reg.MustRegister(m.BuildInfo, m.EventsReceived, m.WALSyncSeconds,
+	reg.MustRegister(m.BuildInfo, m.EventsReceived, m.SitesResolved, m.WALSyncSeconds,
 		m.WALUnsyncedEvents, m.CompactionLagSeconds, m.UploadedBytes, m.HTTPRequests)
 
 	m.BuildInfo.WithLabelValues(version).Set(1)

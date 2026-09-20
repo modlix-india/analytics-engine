@@ -250,3 +250,57 @@ func TestEmptySiteReturnsNoRows(t *testing.T) {
 		t.Errorf("got %d rows for a site with no data", len(res.Rows))
 	}
 }
+
+// A request that names no zone must still mean something definite, and that something is the
+// engine's configured default rather than the machine's. Modlix sets it to Asia/Kolkata; the
+// engine's own default stays UTC so a standalone deployment cannot inherit an opinion from
+// whichever host it happens to run on.
+func TestDefaultTimezoneAppliesWhenTheRequestNamesNone(t *testing.T) {
+	if _, err := time.LoadLocation("Asia/Kolkata"); err != nil {
+		t.Skipf("timezone database unavailable: %v", err)
+	}
+
+	// 23:45 IST on the 19th, which is still the 19th in UTC — so the two zones put this
+	// event on different calendar days and the answer reveals which one was used.
+	dir := fixture(t, []store.Row{pv(utc(2026, 9, 19, 18, 15), "/a", "v1")})
+
+	from := utc(2026, 9, 19, 0, 0)
+	to := utc(2026, 9, 21, 0, 0)
+
+	e := New(dir)
+	e.DefaultTimezone = "Asia/Kolkata"
+	res, err := e.Query(context.Background(), Request{
+		Widget: WidgetPageviewsOverTime, Site: "s.example", From: from, To: to,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var day string
+	for _, r := range res.Rows {
+		if r.Events > 0 {
+			day = r.Label
+		}
+	}
+	if day != "2026-09-19" {
+		t.Errorf("the event landed on %q with the IST default; want 2026-09-19", day)
+	}
+
+	// An explicit zone on the request still wins over the default.
+	res2, err := e.Query(context.Background(), Request{
+		Widget: WidgetPageviewsOverTime, Site: "s.example", From: from, To: to,
+		Timezone: "Pacific/Kiritimati", // UTC+14, so 18:15 UTC is already the 20th
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	day = ""
+	for _, r := range res2.Rows {
+		if r.Events > 0 {
+			day = r.Label
+		}
+	}
+	if day != "2026-09-20" {
+		t.Errorf("an explicit zone put the event on %q; want 2026-09-20, so the request must override the default", day)
+	}
+}

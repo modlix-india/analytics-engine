@@ -92,6 +92,50 @@ type Config struct {
 	// deleting a customer's history because a variable was unset is not recoverable.
 	RemoteRetention time.Duration
 
+	// SecurityURL turns on the Modlix site resolver. Empty leaves the standalone one in
+	// place, where the hostname IS the site — which is what the MIT repo is for and what
+	// local development needs.
+	//
+	// This must be a service address on a network the outside world cannot reach: the
+	// endpoints it calls are `/internal/` ones, protected by nginx rather than by the
+	// gateway, whose `(.*internal.*)` rule does not do what its name suggests.
+	SecurityURL string
+
+	// ResolveBudget is the longest ingest will wait for a site lookup before dropping the
+	// event. Small on purpose: the WAL append must never queue behind a dependency, and a
+	// dropped pageview costs a rounding error where a stalled ingest path costs an outage.
+	ResolveBudget time.Duration
+
+	// ResolveTTL and ResolveNegativeTTL are how long a resolution and a non-resolution are
+	// remembered. Separate settings because they are different risks: a stale real site
+	// delays a customer's first numbers, while a short negative TTL lets a scanner turn
+	// every request into a security call.
+	ResolveTTL         time.Duration
+	ResolveNegativeTTL time.Duration
+
+	// Redis is the shared half of the resolver's cache, and the reason a fleet of nodes
+	// resolves a host once rather than once each. Empty is valid: each node then keeps its
+	// own in-process cache and hears no eviction announcements, which is correct for one
+	// node and wrong for several.
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
+	// RedisPrefix is `redis.cache.prefix` on the Java side — "cmn" in every environment
+	// today. It has to match, because it is half of both the hash name we read and the
+	// eviction messages we listen for. Set it wrong and the cache works perfectly and is
+	// never invalidated, which is the hardest version of this bug to notice.
+	RedisPrefix string
+
+	// DefaultTimezone is the zone a query uses when the caller names none.
+	//
+	// UTC here, deliberately, even though Modlix's own default is Asia/Kolkata: this engine
+	// has no opinion about where its operator lives, and a default that silently follows
+	// the deployment produces numbers nobody can reproduce. The Modlix deployment sets it,
+	// and `ui` resolves the real chain per request — request zone, then the client's
+	// `security_client.TIME_ZONE`, then this.
+	DefaultTimezone string
+
 	LogLevel string
 }
 
@@ -129,6 +173,18 @@ func Load() (Config, error) {
 		LocalRetention:    envDur("ANALYTICS_LOCAL_RETENTION", 0),
 		RemoteRetention:   envDur("ANALYTICS_REMOTE_RETENTION", 0),
 
+		SecurityURL:        envStr("ANALYTICS_SECURITY_URL", ""),
+		ResolveBudget:      envDur("ANALYTICS_RESOLVE_BUDGET", 250*time.Millisecond),
+		ResolveTTL:         envDur("ANALYTICS_RESOLVE_TTL", 5*time.Minute),
+		ResolveNegativeTTL: envDur("ANALYTICS_RESOLVE_NEGATIVE_TTL", time.Minute),
+
+		RedisAddr:     envStr("ANALYTICS_REDIS_ADDR", ""),
+		RedisPassword: os.Getenv("ANALYTICS_REDIS_PASSWORD"),
+		RedisDB:       envInt("ANALYTICS_REDIS_DB", 0),
+		RedisPrefix:   envStr("ANALYTICS_REDIS_PREFIX", "cmn"),
+
+		DefaultTimezone: envStr("ANALYTICS_DEFAULT_TIMEZONE", "UTC"),
+
 		LogLevel: envStr("ANALYTICS_LOG_LEVEL", "info"),
 	}
 
@@ -149,6 +205,16 @@ func Load() (Config, error) {
 		// Half-configured object storage is worse than none: the node would look replicated,
 		// prune nothing, and fail every upload into the log.
 		return Config{}, fmt.Errorf("S3 bucket is set but endpoint, access key or secret key is missing")
+	}
+	if _, err := time.LoadLocation(c.DefaultTimezone); err != nil {
+		// Refused at boot rather than per query: an unknown zone would otherwise surface
+		// as every dashboard erroring at once, long after the variable was set.
+		return Config{}, fmt.Errorf("ANALYTICS_DEFAULT_TIMEZONE %q is not an IANA zone: %w", c.DefaultTimezone, err)
+	}
+	if c.RedisAddr != "" && c.SecurityURL == "" {
+		// Redis here exists only to share site resolutions between nodes. Configured
+		// without a resolver it caches nothing and quietly suggests otherwise.
+		return Config{}, fmt.Errorf("ANALYTICS_REDIS_ADDR is set but ANALYTICS_SECURITY_URL is not, so there is nothing to cache")
 	}
 	if c.LocalRetention > 0 && c.S3Bucket == "" {
 		// Local retention deletes data once it is uploaded. With nowhere to upload to, it

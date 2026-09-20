@@ -867,7 +867,32 @@ Each ends in something runnable.
    sides of an IST day boundary, which no rollup can separate and which the raw boundary scan
    resolves exactly. `rawHoursScanned` is reported on every response, and is 0 for whole-hour
    zones and 2 for half-hour ones however long the range.
-10. **Modlix resolver** — security call, the two Redis caches, invalidation hooks.
+10. **Modlix resolver** — security call, the two Redis caches, invalidation hooks. *(done)*
+
+    Three ways in, in the order they cost: the mobile wrapper's user-agent tag (no lookup),
+    a path-prefixed URL (no lookup), then the hostname through the same endpoint the gateway
+    uses. Proven against the running local security service: `theorempro.in` resolves to
+    `theorem_THRM`, `/sitezump/SYSTEM/page/` to `sitezump_SYSTEM`, a `ModlixApp/2.1.0
+    THRM/theorem` user-agent to `theorem_THRM` with platform and version settled, and an
+    unknown host is dropped and remembered as unknown.
+
+    **Invalidation needs no change on the Modlix side.** `ClientUrlService` and `AppService`
+    already `evictAllFunction("gatewayClientAppCodeType")`, which publishes
+    `cmn-gatewayClientAppCodeType:*` on `evictionChannel`. The engine subscribes to that
+    channel and clears its own entries — verified live by publishing the message and
+    watching `cmn-analyticsSite` empty. What looked like the hard part of this milestone was
+    already being broadcast.
+
+    **A forged page URL cannot name another tenant.** The page URL is payload; `Origin` is
+    set by the browser. The path form is believed only while the two agree, and where they
+    disagree the resolution falls back to `Origin`'s own host — so a script claiming to be
+    somewhere else is counted where it really is. Ingest stays spoofable in the ways every
+    analytics product is; this closes the one that would have been ours.
+
+    **Nothing blocks the WAL.** A resolution waits at most `ANALYTICS_RESOLVE_BUDGET` (250ms)
+    and then drops the event while the lookup finishes in the background and fills the cache.
+    Lookup failures are never cached: security being unreachable says nothing about the host,
+    and remembering it as unknown would bin a real customer's events after the outage ended.
 11. **Modlix integration** — SDK, `AnalyticsService` retarget, delete the rewriter, replace
     the Workers.
 12. **Retire PostHog** — the inventory in section 10, all three environments together.
@@ -926,12 +951,24 @@ changes anything a user sees, so the PostHog stacks keep running untouched until
 4. **`referrer_url` on or off by default?** Browsers usually truncate it to the origin
    anyway, and when they do not it can carry search terms. Recommend off by default,
    switchable on per site.
-5. **Query authorisation in the engine, or `ui` proxying?** Recommend proxying first, per
-   section 9.
-6. **Where does a site's reporting timezone come from?** It has to exist for section 7 to
-   mean anything. Recommend a new `analytics.timezone` on the application definition,
-   defaulting to UTC rather than to the server's zone — a default that silently follows the
-   host is the kind that produces numbers nobody can reproduce.
+5. ~~Query authorisation in the engine, or `ui` proxying?~~ **Decided: `ui` proxies.** It
+   already holds `hasWriteAccess` + `doesClientManageClientCode`, so the engine keeps one
+   shared secret and never learns what an appCode is. Swapping in a per-site `Authorizer`
+   later is a one-interface change.
+6. ~~Where does a site's reporting timezone come from?~~ **Decided, and it needs no new
+   field.** The order is: the zone on the request, then the client's, then `Asia/Kolkata`.
+
+   `security_client.TIME_ZONE` already exists — V81 added it as NOT NULL DEFAULT
+   'Asia/Kolkata', IANA ids captured from the browser at registration, deliberately separate
+   from `BILLING_TIMEZONE`. `security_user.TIME_ZONE` is the per-person override, null
+   meaning inherit. So the proposed `analytics.timezone` on the application definition is
+   dropped: it would have been a second, competing answer to a question the platform had
+   already answered.
+
+   `ui` resolves the chain per request, because it is the side that knows who is asking. The
+   engine keeps `ANALYTICS_DEFAULT_TIMEZONE`, defaulting to **UTC** rather than IST — a
+   general-purpose engine must not inherit an opinion from whichever host it runs on, and
+   the Modlix deployment sets it explicitly.
 
 Settled in discussion, recorded here so they are not reopened: paths, stickiness, lifecycle
 and correlation are all in scope; feature flags are a sibling service; the existing PostHog

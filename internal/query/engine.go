@@ -1,6 +1,7 @@
 package query
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -154,6 +155,14 @@ type Engine struct {
 	// CacheDir holds files fetched from Remote. Defaults to DataDir/cache.
 	CacheDir string
 
+	// DefaultTimezone is used when a request names none. Empty means UTC.
+	//
+	// A default rather than a required field because a query with no zone still has to mean
+	// something definite. What it must NOT do is follow the host's zone: the same question
+	// would then return different day boundaries on two machines, and nobody could reproduce
+	// a number someone else was looking at.
+	DefaultTimezone string
+
 	Log *slog.Logger
 }
 
@@ -179,7 +188,7 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 		req.Limit = 10
 	}
 
-	loc, err := loadLocation(req.Timezone)
+	loc, err := loadLocation(cmp.Or(req.Timezone, e.DefaultTimezone))
 	if err != nil {
 		return nil, err
 	}

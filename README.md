@@ -39,6 +39,12 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 | `ANALYTICS_S3_ENDPOINT` | — | `http://` prefix selects plaintext; anything else uses TLS |
 | `ANALYTICS_S3_ACCESS_KEY` / `_SECRET_KEY` / `_REGION` / `_PREFIX` | — | `OCI_S3_*` is accepted for the first three |
 | `ANALYTICS_REPLICATE_INTERVAL` | `1m` | |
+| `ANALYTICS_DEFAULT_TIMEZONE` | `UTC` | used when a query names no zone; must be an IANA id |
+| `ANALYTICS_SECURITY_URL` | — | set to enable the Modlix site resolver; the host is the site otherwise |
+| `ANALYTICS_RESOLVE_BUDGET` | `250ms` | longest ingest waits for a site lookup before dropping the event |
+| `ANALYTICS_RESOLVE_TTL` / `_NEGATIVE_TTL` | `5m` / `1m` | how long a resolution, and a non-resolution, are kept |
+| `ANALYTICS_REDIS_ADDR` / `_PASSWORD` / `_DB` | — | shares resolutions across nodes and receives cache evictions |
+| `ANALYTICS_REDIS_PREFIX` | `cmn` | must match `redis.cache.prefix` on the Java side |
 | `ANALYTICS_LOCAL_RETENTION` | `0` (keep) | how long Parquet stays on local disk after upload |
 | `ANALYTICS_REMOTE_RETENTION` | `0` (keep forever) | how long it stays in the bucket |
 
@@ -220,6 +226,38 @@ links against, `minio-go`, is Apache-2.0 and a separate project.
 DuckDB is run as a subprocess and is not a Go dependency — it never enters `go.mod` or the
 binary, which is what keeps the `CGO_ENABLED=0` static build intact. Those tests skip if the
 CLI is absent; install it with `brew install duckdb` to run them.
+
+## Resolving an event to a site
+
+By default the hostname is the site, which is what a standalone deployment wants.
+
+Setting `ANALYTICS_SECURITY_URL` turns on the Modlix resolver, which answers with
+`appcode_clientcode` from three signals, in this order:
+
+1. **`ModlixApp/<version> <clientCode>/<appCode>` in the user-agent.** The mobile wrapper
+   states its own site, so there is no lookup at all — and it settles platform and app
+   version at the same time. Older generated apps predate the tag, so its absence falls
+   through rather than discarding.
+2. **A path-prefixed page URL** — `/appCode/clientCode/page/...`, which is how every app
+   without a custom domain is served. Trusted only while the browser-set `Origin` agrees
+   with it: the page URL travels in the payload, so without that check a script could file
+   its events under any tenant it named.
+3. **The hostname**, through the same security endpoint the gateway uses, so the two cannot
+   disagree about which app a host belongs to.
+
+An unrecognised host is discarded, and remembered as unrecognised — that is the common case
+on a public endpoint, not an error. `analytics_sites_resolved_total` carries which path each
+resolution took, because "no traffic" and "stopped resolving" look identical otherwise.
+
+**A lookup never blocks ingest.** Resolution waits at most `ANALYTICS_RESOLVE_BUDGET`; past
+that the event is dropped while the lookup continues in the background and fills the cache
+for the next one. A slow security service costs events, never throughput. Failures are not
+cached either way: security being unreachable says nothing about the host.
+
+Caching is two layers, this process and Redis, and invalidation needs nothing new on the
+Modlix side. The platform already publishes `<prefix>-gatewayClientAppCodeType:*` on
+`evictionChannel` whenever a client URL or an application changes, and the engine listens for
+exactly that.
 
 ## Licence
 
