@@ -23,6 +23,24 @@ import (
 	"github.com/modlix-india/analytics-engine/internal/event"
 )
 
+// canonicalEventName folds the spellings of a page view onto the one name the engine counts.
+//
+// Every traffic widget filters on event.NamePageview. An event stored as "pageview" is
+// therefore not slightly wrong, it is invisible: the file holds it, a raw scan finds it, and
+// the dashboard answers zero rows with no error. The first request this engine ever received
+// that was not written by its own tests hit exactly that, and nothing in the system said so —
+// every fixture in the repo happened to spell it the canonical way.
+//
+// Deliberately one concept and a closed set of spellings. Custom event names are the caller's
+// own vocabulary and are stored verbatim; folding those would be a rename nobody asked for.
+func canonicalEventName(name string) string {
+	switch name {
+	case "pageview", "page_view", "page-view", "pageView", "PageView":
+		return event.NamePageview
+	}
+	return name
+}
+
 // Sink is what ingest writes to. The WAL satisfies it.
 //
 // Deliberately Enqueue and not Append: see the durability note in the wal package. Nothing
@@ -235,7 +253,7 @@ func (i *Ingester) process(r *http.Request, req *batchRequest) {
 			TSServer: now + seq,
 			TSClient: we.TS,
 			Site:     res.Site,
-			Name:     we.Name,
+			Name:     canonicalEventName(we.Name),
 			Path:     path,
 			Page:     we.Page,
 			Label:    we.Label,

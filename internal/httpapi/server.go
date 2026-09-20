@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -83,11 +84,20 @@ func New(o Options) *Server {
 // has been recorded and not acknowledged. The client retries and the event arrives twice.
 // Draining keeps that window to requests genuinely in flight at shutdown.
 func (s *Server) Start(ctx context.Context) error {
+	// Bind before logging, and report a bind failure to the caller synchronously. The
+	// combined ListenAndServe logged "http listening" and then failed on a port conflict,
+	// so the one line an operator greps for was printed by a process that never served a
+	// request.
+	ln, err := net.Listen("tcp", s.srv.Addr)
+	if err != nil {
+		return err
+	}
+	s.log.Info("http listening", "addr", ln.Addr().String())
+
 	errc := make(chan error, 1)
 
 	go func() {
-		s.log.Info("http listening", "addr", s.srv.Addr)
-		if err := s.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 			return
 		}

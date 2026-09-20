@@ -13,6 +13,7 @@ import (
 
 	"github.com/modlix-india/analytics-engine/internal/objstore"
 
+	"github.com/modlix-india/analytics-engine/internal/event"
 	"github.com/modlix-india/analytics-engine/internal/rollup"
 	"github.com/modlix-india/analytics-engine/internal/store"
 )
@@ -171,7 +172,7 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 		// question. Defaulting to $pageview here would make that impossible to express.
 	default:
 		if req.Event == "" {
-			req.Event = "$pageview"
+			req.Event = event.NamePageview
 		}
 	}
 	if req.Limit <= 0 {

@@ -7,8 +7,10 @@ One static Go binary. It ingests events over HTTP, acknowledges them in microsec
 appending to a write-ahead log, folds closed segments into Parquet, and answers a fixed set of
 analytics questions from pre-aggregated rollups. No Kafka, no ClickHouse, no database, no cgo.
 
-**Status: in development.** The skeleton runs; ingest and query do not exist yet. See
-[PLAN.md](PLAN.md) for the design and the milestone order.
+**Status: in development.** Ingest, storage, rollups, the fixed widget API and replication
+to object storage all work end to end. Site resolution is still the standalone one (the host
+is the site) and nothing is wired into Modlix yet. See [PLAN.md](PLAN.md) for the design and
+the milestone order.
 
 ## Running
 
@@ -46,8 +48,33 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 |---|---|
 | `GET /healthz` | the process is alive. Checks nothing else on purpose: a liveness probe that fails on a dependency restarts a process that would have recovered |
 | `GET /readyz` | this node can accept writes |
+| `POST /i` | ingest a batch — public, write-only, answers 204 either way |
 | `POST /q` | run one of the fixed widgets — see below |
 | `GET /metrics` | Prometheus |
+
+## Ingesting
+
+```bash
+curl -X POST http://localhost:8080/i -H 'Origin: https://shop.example' \
+  -d '{"u":"https://shop.example/pricing","r":"https://www.google.com/","b":[{"e":"pageview"}]}'
+```
+
+`u` page URL, `r` referrer, `v`/`s` visitor and session if the client tracks them, `x`/`n`
+experiment and variant, `b` the batch. Per event: `e` name, `t` client timestamp, `l` label,
+`g` page identity, `u` a URL that overrides the batch's for a SPA that navigated, `p` props.
+The site comes from `Origin` or `Referer` — there is no site key. Keys are short because the
+beacon's size is paid by the visitor on every page view, and this is a public contract: fields
+may be added, none may be renamed or repurposed.
+
+**A page view is stored as `$pageview`.** Ingest folds `pageview`, `page_view`, `page-view`
+and `pageView` onto it, because every traffic widget filters on that one name and an event
+stored under another spelling is not slightly wrong but invisible — the file holds it and the
+dashboard answers zero with no error. Every other event name is the caller's own vocabulary
+and is stored exactly as sent.
+
+204 is returned whether an event was stored or discarded. A public endpoint that reports
+which inputs it rejected is a probe for finding the ones it accepts; `analytics_events_received_total`
+carries the outcome for the operator.
 
 ## Querying
 
@@ -171,12 +198,24 @@ The object storage client has integration tests against a real server, skipped u
 `AE_S3_ENDPOINT` is set:
 
 ```bash
-docker run -d --rm -p 19000:9000 --name ae-minio \
-  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
 AE_S3_ENDPOINT=localhost:19000 AE_S3_BUCKET=aetest \
-  AE_S3_ACCESS_KEY=minioadmin AE_S3_SECRET_KEY=minioadmin \
+  AE_S3_ACCESS_KEY=modlix AE_S3_SECRET_KEY='Kiran@123' \
   go test ./internal/objstore/ -run TestS3
 ```
+
+That server is `dbs/minio` in the Modlix monorepo (`docker compose up -d`), which publishes
+19000 and creates the `aetest` bucket. Standalone:
+
+```bash
+docker run -d --rm -p 19000:9000 --name ae-minio \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+```
+
+**quay.io, not Docker Hub.** `docker pull minio/minio` now answers "pull access denied ...
+repository does not exist" for anonymous pulls; quay serves the identical image. The MinIO
+server is AGPL-3.0 and is used here only as a local test double — the client this engine
+links against, `minio-go`, is Apache-2.0 and a separate project.
 
 DuckDB is run as a subprocess and is not a Go dependency — it never enters `go.mod` or the
 binary, which is what keeps the `CGO_ENABLED=0` static build intact. Those tests skip if the

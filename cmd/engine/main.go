@@ -101,8 +101,17 @@ func run() error {
 
 	// SIGTERM is what a container orchestrator sends, SIGINT what a terminal sends. Both mean
 	// the same thing here: stop taking work and finish what is in hand.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// A cancel of our own, on top of the signal context. Everything below can return an
+	// error, and the background loops started below are waited on by deferred receives. A
+	// deferred `stop()` is registered first and therefore runs LAST, so without this a
+	// startup failure would block forever on loops nobody had told to stop: the process
+	// exits only when someone kills it, and a supervisor sees a running engine that is
+	// serving nothing. Measured: a port conflict hung for 180s and was still going.
+	ctx, stopLoops := context.WithCancel(sigCtx)
+	defer stopLoops()
 
 	// Object storage is optional. Without it everything stays local, which is correct for
 	// development and for a single node with its own backups.
@@ -137,7 +146,10 @@ func run() error {
 		defer close(compactDone)
 		comp.Run(ctx)
 	}()
-	defer func() { <-compactDone }()
+	// stopLoops before the receive, not just at the end of run: the wait is only safe if the
+	// loop has been told to finish, and each wait therefore guarantees its own precondition
+	// rather than relying on the order the defers were registered in.
+	defer func() { stopLoops(); <-compactDone }()
 
 	if remote != nil {
 		rep := replicate.New(replicate.Options{
@@ -154,7 +166,7 @@ func run() error {
 			defer close(replicateDone)
 			rep.Run(ctx)
 		}()
-		defer func() { <-replicateDone }()
+		defer func() { stopLoops(); <-replicateDone }()
 	}
 
 	// Reads are denied unless a secret is configured. An embedder replaces SharedSecret with

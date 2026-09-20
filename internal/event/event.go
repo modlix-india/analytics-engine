@@ -69,6 +69,14 @@ type Event struct {
 // It is what makes a rolling deploy safe: a new binary can still read segments written by the
 // previous one, which matters because a restart leaves up to one compaction interval of
 // events on disk. Adding a field means appending it and bumping this.
+// NamePageview is the canonical name of a page view.
+//
+// It has a definition here rather than a string literal at each end because both ends must
+// agree exactly: ingest stores what the client sent, and every traffic widget filters on this
+// name. Disagree by one character and the dashboard reports zero for data that is present,
+// correct and queryable — no error anywhere, because nothing is wrong except the spelling.
+const NamePageview = "$pageview"
+
 const encodingVersion byte = 1
 
 // Encode appends the packed form of e to dst.

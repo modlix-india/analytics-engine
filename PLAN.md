@@ -839,6 +839,29 @@ Each ends in something runnable.
    queries from local data, and deleted nothing. The degradation path was exercised by
    accident and behaved as designed.
 
+   **Then a local MinIO went into `dbs/minio`, and putting the engine in front of it found
+   two more things no unit test could.**
+
+   *A page view sent as `pageview` was invisible.* Ingest stored the name verbatim, every
+   traffic widget defaults to `$pageview`, and every fixture in this repo happened to spell it
+   the canonical way — so each layer was right and the chain was not. The dashboard answered
+   zero rows, with no error, for data sitting correctly in the Parquet file. The name now has
+   one definition (`event.NamePageview`), ingest folds the obvious spellings onto it, custom
+   names are still stored verbatim, and `internal/e2e` drives a real HTTP request through the
+   WAL, the compactor and the query handler — the only kind of test that does not get to
+   choose the spelling, which is exactly why it catches this class.
+
+   *A port conflict hung the process instead of failing it.* `run()` waits on the compactor
+   and replicator in deferred receives, and the signal context's cancel is deferred first and
+   therefore runs last — so any early return blocked forever on loops nobody had told to stop.
+   A second engine on a taken port stayed alive with nothing listening, `/healthz` answered by
+   the other process, and the bind error surfacing only when someone killed it by hand. Each
+   wait now cancels before it waits. `cmd/engine` has the regression test; it failed for 180s
+   before the fix and passes in 0.01s after.
+
+   Both are the same shape as the `UseSSL` finding: the bug was in the wiring between correct
+   parts, and only running the assembled thing showed it.
+
    Milestones 1-5 are complete. The half-hour timezone correction is implemented and tested
    against the case that motivated it: two events in the SAME UTC hour falling on opposite
    sides of an IST day boundary, which no rollup can separate and which the raw boundary scan
