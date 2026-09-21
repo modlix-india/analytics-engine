@@ -897,7 +897,7 @@ Each ends in something runnable.
     the Workers. *(done, except the Workers)*
 
     Proven end to end on the local stack, in a real browser: a page loads the beacon over
-    https from `analytics.local.modlix.com`, fires a page view, a labelled click and a custom
+    https from `engine.local.modlix.com`, fires a page view, a labelled click and a custom
     event with properties, and all three arrive in one batch. The engine resolves the site
     from the path form, stores `$pageview` / `click` / `checkout_started` under
     `modlix_SYSTEM`, and `POST /api/ui/analytics/query` answers them through `ui` with the
@@ -956,7 +956,46 @@ Each ends in something runnable.
     it listens on). The analytics VMs are separate from the app VMs, so either the engine
     moves onto the app VMs or those two paths are opened to it. That decision changes what
     the deployment stack looks like, so no stack has been written on a guess.
-13. **Paths** — sequence to edge counts, with step and branching caps.
+13. **Heatmaps** — capture, storage and rendering. *(done)*
+
+    Was section 13's open decision, and the toggle had been on for two apps while nothing
+    captured, stored or drew anything. Now: the beacon records a position on every click as a
+    separate `$click` event, the position rides in three typed columns rather than the props
+    JSON, and a `heatmap` widget aggregates them into a grid at read time.
+
+    **Raw, not a rollup.** A rollup has thrown the coordinates away, and rolling clicks into
+    cells at compaction would fix the grid resolution forever at whatever we guessed today.
+    The scan is bounded to one site, one path and one range, and a heatmap is asked for by a
+    person looking at one page rather than by a dashboard refreshing twelve tiles.
+
+    **Proportional x, absolute y, and the width travels too.** A pixel abscissa means the
+    middle of a phone and the left gutter of a desktop, so a map averaging the two draws a
+    picture of nowhere. Clicks are banded by viewport — phone, tablet, desktop — because a
+    band is a layout.
+
+    **Rendering is the live page in a frame with a canvas over it**, per experiment arm, with
+    the overlay switchable so the page underneath stays usable — which is how you sign in, or
+    open a menu, to see the state the clicks happened in. The frame is made as tall as the
+    page rather than scrolled: a cross-origin frame will not say where it has been scrolled
+    to, and an overlay that cannot follow the scroll draws every click in the wrong place,
+    convincingly.
+
+    Proven against crumbco: 25 desktop clicks and 3 phone ones, the app's own A/B arms in the
+    variant picker, each arm drawing its own map.
+
+    Two things this needs that are not code:
+
+    * **Framing permission.** `X-Frame-Options: SAMEORIGIN` blocks the frame cross-host. The
+      app being measured has to allow the builder's origin in `csp.frameAncestors`, which
+      modern browsers honour over the older header. Per-app and server-side, so nothing a
+      caller can turn on for themselves. It works locally only because the dev server sends
+      no such header — which is a false positive worth knowing about.
+    * **Read access to the application.** The Analytics pane loads the app definition to
+      learn its client and whether analytics is on, and that read is 403 for an app the
+      signed-in client does not own — even where the analytics query itself is allowed. The
+      pane therefore cannot show crumbco to a SYSTEM developer today.
+
+14. **Paths** — sequence to edge counts, with step and branching caps.
 14. **Correlation** — contingency tables, chi-squared with a Fisher fallback, Benjamini-Hochberg.
     Last of the analyses because it depends on the funnel and is the one that can be
     confidently wrong.
@@ -1006,8 +1045,9 @@ changes anything a user sees, so the PostHog stacks keep running untouched until
    widgets. Recommend approximate, labelled honestly.
 2. **Late-arrival policy** — reject beyond N hours, or a late file and re-rollup. Recommend
    rejecting beyond 24h and saying so in the response.
-3. **Heatmaps** — remove the settings toggle, or commit to building capture? Recommend
-   removing it for now.
+3. ~~Heatmaps — remove the settings toggle, or commit to building capture?~~ **Decided:
+   built.** See milestone 13. The toggle now does what it says, which it had not since the
+   vendor snippet was replaced.
 4. **`referrer_url` on or off by default?** Browsers usually truncate it to the origin
    anyway, and when they do not it can carry search terms. Recommend off by default,
    switchable on per site.

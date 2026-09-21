@@ -229,3 +229,36 @@ func TestHourOfTruncatesToUTCHour(t *testing.T) {
 		t.Errorf("HourOf(10:59) = %v, want %v", time.UnixMilli(got).UTC(), time.UnixMilli(want).UTC())
 	}
 }
+
+// Both halves of an A/B assignment are rolled up.
+//
+// `variant` alone was a dimension from the start; `experiment` was stored on the event and
+// never aggregated, so a site running two tests had both their arms in one variant breakdown
+// with no way to tell which test a row belonged to. Modlix works around the remaining half of
+// that -- there is no filter on a query, so it cannot ask for one experiment's arms -- by
+// sending the rule key as part of the variant value. This dimension is what makes the
+// experiment itself answerable.
+func TestExperimentAndVariantAreBothRolledUp(t *testing.T) {
+	r := row(at(10, 0), "$pageview", "/", "v1", "s1")
+	r.Experiment = "1EVfJvnNJb5Tw9F21yU0rT"
+	r.Variant = "1EVfJvnNJb5Tw9F21yU0rT:homeTwo"
+
+	rolled := Build([]store.Row{r})
+
+	if got := find(rolled, "$pageview", DimExperiment, "1EVfJvnNJb5Tw9F21yU0rT"); got == nil {
+		t.Error("the experiment dimension was not rolled up")
+	}
+	if got := find(rolled, "$pageview", DimVariant, "1EVfJvnNJb5Tw9F21yU0rT:homeTwo"); got == nil {
+		t.Error("the variant dimension was not rolled up")
+	}
+}
+
+// An event outside any test must not create a row under a blank experiment, which would make
+// "views in an experiment" and "views overall" the same number.
+func TestAnEventInNoExperimentIsNotRolledUpUnderABlankKey(t *testing.T) {
+	rolled := Build([]store.Row{row(at(10, 0), "$pageview", "/", "v1", "s1")})
+
+	if got := find(rolled, "$pageview", DimExperiment, ""); got != nil {
+		t.Errorf("an event with no experiment produced a rollup row: %+v", got)
+	}
+}

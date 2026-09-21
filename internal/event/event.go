@@ -58,6 +58,18 @@ type Event struct {
 	Experiment string
 	Variant    string
 
+	// Where a click landed, and how wide the window was when it did. Zero on every event
+	// that is not a click — which is most of them, and costs nothing: a column of zeros
+	// compresses to almost nothing.
+	//
+	// ClickX is a PROPORTION of the viewport width, in ten-thousandths, not a pixel. A pixel
+	// abscissa means different things on a phone and a desktop, so averaging the two produces
+	// a picture of nowhere. ClickY is absolute pixels from the top of the document, because
+	// vertical position does not scale with width — a header is a header at any size.
+	ClickX   int32
+	ClickY   int32
+	Viewport int32 // css pixels of viewport width, for banding
+
 	// Props is the JSON tail: anything the caller sent that has no column. Stored as received
 	// so an unmodelled field is never silently dropped, and nothing in the fixed widget set
 	// filters on it.
@@ -77,7 +89,7 @@ type Event struct {
 // correct and queryable — no error anywhere, because nothing is wrong except the spelling.
 const NamePageview = "$pageview"
 
-const encodingVersion byte = 1
+const encodingVersion byte = 2
 
 // Encode appends the packed form of e to dst.
 //
@@ -93,6 +105,12 @@ func Encode(dst []byte, e *Event) []byte {
 		dst = binary.AppendUvarint(dst, uint64(len(s)))
 		dst = append(dst, s...)
 	}
+
+	// Numbers last, after every string, so that a v1 record — which has none of them — is
+	// exactly a v2 record that ended early.
+	for _, n := range e.numbers() {
+		dst = binary.AppendVarint(dst, int64(n))
+	}
 	return dst
 }
 
@@ -106,8 +124,8 @@ func Decode(b []byte) (*Event, error) {
 	if len(b) == 0 {
 		return nil, fmt.Errorf("event: empty record")
 	}
-	if b[0] != encodingVersion {
-		return nil, fmt.Errorf("event: unknown encoding version %d", b[0])
+	if b[0] > encodingVersion {
+		return nil, fmt.Errorf("event: encoding version %d is newer than this binary understands", b[0])
 	}
 	b = b[1:]
 
@@ -144,6 +162,19 @@ func Decode(b []byte) (*Event, error) {
 		b = b[length:]
 	}
 
+	for _, p := range e.numberPtrs() {
+		if len(b) == 0 {
+			// A v1 record, or a v2 one written before this field existed.
+			break
+		}
+		v, n := binary.Varint(b)
+		if n <= 0 {
+			return nil, fmt.Errorf("event: bad number")
+		}
+		*p = int32(v)
+		b = b[n:]
+	}
+
 	return &e, nil
 }
 
@@ -160,6 +191,17 @@ func (e *Event) strings() []string {
 		e.Experiment, e.Variant,
 		e.Props,
 	}
+}
+
+// numbers and numberPtrs carry the same rule as strings and stringPtrs: same order, next to
+// each other, so a field added to one and not the other is visible rather than being a silent
+// shift of everything after it.
+func (e *Event) numbers() []int32 {
+	return []int32{e.ClickX, e.ClickY, e.Viewport}
+}
+
+func (e *Event) numberPtrs() []*int32 {
+	return []*int32{&e.ClickX, &e.ClickY, &e.Viewport}
 }
 
 func (e *Event) stringPtrs() []*string {

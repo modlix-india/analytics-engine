@@ -45,6 +45,7 @@ const (
 	DimPlatform    = "platform"
 	DimAppVersion  = "app_version"
 	DimCountry     = "country"
+	DimExperiment  = "experiment"
 	DimVariant     = "variant"
 )
 
@@ -154,6 +155,7 @@ func Build(rows []store.Row) []Row {
 			{DimPlatform, r.Platform},
 			{DimAppVersion, r.AppVersion},
 			{DimCountry, r.Country},
+			{DimExperiment, r.Experiment},
 			{DimVariant, r.Variant},
 		} {
 			if d.val == "" {

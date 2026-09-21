@@ -81,6 +81,17 @@ mlx('experiment', 'pricing', 'b')
 mlx('consent', true)              // false revokes and stops everything
 ```
 
+With `data-heatmaps="true"` it also records **where** each click landed, as a separate
+`$click` event carrying a position and nothing about what was hit. That is deliberately not
+the same event as autocapture's labelled `click`: switching heatmaps on must not change what
+the funnel or the event list say. It is off by default, because every click on the page
+becomes an event where autocapture records only the labelled ones.
+
+A position is stored as a PROPORTION of the viewport width (in ten-thousandths) plus an
+absolute y in document pixels, and the width itself travels with it. A pixel abscissa means
+the middle of a phone and the left gutter of a desktop, so a map that averages the two is a
+picture of nowhere — the reader bands by width instead, and the engine keeps them apart.
+
 It sends a session id and no visitor id: the engine derives the visitor from a daily-rotating
 salt, so there is no durable identifier in the page. Page views follow SPA navigation.
 Autocapture is **only** elements carrying `data-analytics-label` — deliberately narrower than
@@ -143,10 +154,21 @@ curl -X POST http://localhost:8080/q -H 'Authorization: Bearer $ANALYTICS_QUERY_
 | `retention` | cohorts by first-seen `period` (day/week) |
 | `stickiness` | how many distinct periods each visitor was active |
 | `lifecycle` | new / returning / resurrecting / dormant per period |
+| `heatmapPages` | the pages that have clicks at all, ranked |
+| `heatmap` | where clicks landed on ONE page, as a grid — takes `path`, and optionally `variant` and `viewport` |
 
-`breakdownByProperty` accepts only an allow-listed dimension. That list is what keeps this a
-fixed widget API rather than an arbitrary query surface, so `visitor`, `session` and `props`
-are not among them.
+`breakdownByProperty` accepts only an allow-listed dimension: `path`, `page`, `label`,
+`referrer_host`, `channel`, `utm_source`, `utm_medium`, `utm_campaign`, `device`, `browser`,
+`os`, `platform`, `app_version`, `country`, `experiment`, `variant`. That list is what keeps
+this a fixed widget API rather than an arbitrary query surface, so `visitor`, `session` and
+`props` are not among them.
+
+**There is no filter on a request**, only the event name and one dimension. So an A/B readout
+is `breakdownByProperty` over the conversion's own event name with `property: "variant"`, and
+a caller running more than one test at a time must make its variant values globally unique —
+Modlix sends `<ruleKey>:<page>` — because nothing here can narrow a variant breakdown to one
+experiment. The `experiment` dimension answers questions *about* experiments; it cannot scope
+another breakdown to one.
 
 There is no free-form query language, and that is the read security model: with no
 client-supplied expression there is nothing to sanitise, and no request can widen its scope

@@ -23,6 +23,26 @@ import (
 	"github.com/modlix-india/analytics-engine/internal/event"
 )
 
+// NameClick is a click with a position: the heatmap's raw material.
+//
+// Distinct from the labelled "click" that autocapture records, and deliberately so. A labelled
+// click is a decision somebody made about what matters, and there are few of them; this one
+// fires for every click anywhere on the page and exists only to be drawn. Keeping them apart
+// means turning heatmaps on cannot change what the funnel and the event list say.
+const NameClick = "$click"
+
+// clampCoord bounds a client-supplied coordinate. Negative becomes zero: a click above the
+// document is not a thing, and a negative here would be a blob drawn off the top of a canvas.
+func clampCoord(v, max int32) int32 {
+	if v < 0 {
+		return 0
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
 // canonicalEventName folds the spellings of a page view onto the one name the engine counts.
 //
 // Every traffic widget filters on event.NamePageview. An event stored as "pageview" is
@@ -76,6 +96,12 @@ type wireEvent struct {
 	Page  string          `json:"g"`
 	URL   string          `json:"u"` // overrides the batch URL, for a SPA that navigated
 	Props json.RawMessage `json:"p"`
+
+	// Where a click landed. X is ten-thousandths of the viewport width, Y absolute pixels
+	// down the document, W the viewport width in css pixels. Only a click carries them.
+	X int32 `json:"x"`
+	Y int32 `json:"y"`
+	W int32 `json:"w"`
 }
 
 type Options struct {
@@ -278,7 +304,15 @@ func (i *Ingester) process(r *http.Request, req *batchRequest) {
 
 			Experiment: req.Exp,
 			Variant:    req.Variant,
-			Props:      string(we.Props),
+
+			// Clamped rather than trusted. These come from a public endpoint, and a
+			// coordinate outside the viewport is either a bug or someone testing what
+			// this accepts; either way it must not reach a renderer that will happily
+			// draw a blob a million pixels off the page.
+			ClickX:   clampCoord(we.X, 10000),
+			ClickY:   clampCoord(we.Y, 200000),
+			Viewport: clampCoord(we.W, 20000),
+			Props:    string(we.Props),
 		}
 
 		seq++

@@ -56,6 +56,11 @@ type request struct {
 	WindowHours int      `json:"windowHours"`
 	Period      string   `json:"period"`
 
+	// Heatmap only: the page, the experiment arm, and the width band to draw.
+	Path     string `json:"path"`
+	Variant  string `json:"variant"`
+	Viewport int32  `json:"viewport"`
+
 	Limit int `json:"limit"`
 }
 
@@ -115,6 +120,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		From: from, To: to, Timezone: req.Timezone,
 		Event: req.Event, Property: req.Property,
 		Steps: req.Steps, WindowHours: req.WindowHours, Period: req.Period,
+		Path: req.Path, Variant: req.Variant, Viewport: req.Viewport,
 		Limit: req.Limit,
 	})
 	if err != nil {

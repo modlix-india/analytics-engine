@@ -1,6 +1,7 @@
 package event
 
 import (
+	"encoding/binary"
 	"reflect"
 	"testing"
 )
@@ -20,6 +21,7 @@ func filledEvent() *Event {
 		Device: "device", Browser: "browser", OS: "os",
 		Platform: "platform", AppVersion: "appversion", Country: "country",
 		Experiment: "experiment", Variant: "variant",
+		ClickX: 5000, ClickY: 1280, Viewport: 1440,
 		Props: `{"k":"v"}`,
 	}
 }
@@ -38,18 +40,37 @@ func TestRoundTrip(t *testing.T) {
 
 // Guards the invariant directly rather than only through the round trip, so the failure names
 // the cause instead of showing a confusing diff.
-func TestStringFieldListsAgree(t *testing.T) {
+//
+// Every field of Event has to appear in exactly one pair of lists. A field in neither is
+// silently dropped on the way to Parquet; a field in one list but not its partner shifts every
+// column after it, which is the kind of corruption that looks like bad data rather than a bug.
+func TestFieldListsAgree(t *testing.T) {
 	e := filledEvent()
 	if len(e.strings()) != len(e.stringPtrs()) {
 		t.Fatalf("strings() has %d entries, stringPtrs() has %d: they must correspond",
 			len(e.strings()), len(e.stringPtrs()))
 	}
+	if len(e.numbers()) != len(e.numberPtrs()) {
+		t.Fatalf("numbers() has %d entries, numberPtrs() has %d: they must correspond",
+			len(e.numbers()), len(e.numberPtrs()))
+	}
 
 	// Reflection catches the other half: a field added to the struct but to neither list.
-	n := reflect.TypeOf(Event{}).NumField()
-	const nonStringFields = 2 // TSServer, TSClient
-	if got, want := len(e.strings()), n-nonStringFields; got != want {
-		t.Errorf("Event has %d string fields but strings() lists %d; a new field was not added to both lists", want, got)
+	var strs, nums int
+	rt := reflect.TypeOf(Event{})
+	for i := 0; i < rt.NumField(); i++ {
+		switch rt.Field(i).Type.Kind() {
+		case reflect.String:
+			strs++
+		case reflect.Int32:
+			nums++
+		}
+	}
+	if got := len(e.strings()); got != strs {
+		t.Errorf("Event has %d string fields but strings() lists %d; a new field was not added to both lists", strs, got)
+	}
+	if got := len(e.numbers()); got != nums {
+		t.Errorf("Event has %d int32 fields but numbers() lists %d; a new field was not added to both lists", nums, got)
 	}
 }
 
@@ -125,5 +146,33 @@ func BenchmarkDecode(b *testing.B) {
 		if _, err := Decode(packed); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// A record written before the click columns existed must still decode, with those fields
+// zero rather than as an error. This is the property that makes a rolling deploy safe: a
+// restart leaves up to one compaction interval of segments on disk, written by the binary
+// that is being replaced.
+func TestVersionOneRecordStillDecodes(t *testing.T) {
+	// Encoded the way version 1 did it: the version byte, the timestamps, the strings, and
+	// nothing after them.
+	e := filledEvent()
+	v1 := []byte{1}
+	v1 = binary.AppendVarint(v1, e.TSServer)
+	v1 = binary.AppendVarint(v1, e.TSClient)
+	for _, s := range e.strings() {
+		v1 = binary.AppendUvarint(v1, uint64(len(s)))
+		v1 = append(v1, s...)
+	}
+
+	got, err := Decode(v1)
+	if err != nil {
+		t.Fatalf("a version 1 record no longer decodes: %v", err)
+	}
+	if got.Site != e.Site || got.Name != e.Name || got.Props != e.Props {
+		t.Errorf("strings did not survive: %+v", got)
+	}
+	if got.ClickX != 0 || got.ClickY != 0 || got.Viewport != 0 {
+		t.Errorf("fields that did not exist in version 1 came back non-zero: %+v", got)
 	}
 }

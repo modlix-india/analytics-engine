@@ -40,6 +40,11 @@ const (
 	// Per-visitor analyses. These cannot be answered from rollups — they depend on the order
 	// and spacing of one visitor's events — so they read raw Parquet through a narrow
 	// projection. Their counts are EXACT rather than sketch estimates.
+	// Where clicks landed on one page, and which pages have any. Neither reads rollups:
+	// coordinates are not a dimension you can sum, and a rollup has thrown them away.
+	WidgetHeatmap      = "heatmap"
+	WidgetHeatmapPages = "heatmapPages"
+
 	WidgetFunnel     = "funnel"
 	WidgetRetention  = "retention"
 	WidgetStickiness = "stickiness"
@@ -77,7 +82,7 @@ var propertyDims = map[string]bool{
 	rollup.DimUTMSource: true, rollup.DimUTMMedium: true, rollup.DimUTMCampaign: true,
 	rollup.DimDevice: true, rollup.DimBrowser: true, rollup.DimOS: true,
 	rollup.DimPlatform: true, rollup.DimAppVersion: true, rollup.DimCountry: true,
-	rollup.DimVariant: true,
+	rollup.DimExperiment: true, rollup.DimVariant: true,
 }
 
 type Request struct {
@@ -106,6 +111,17 @@ type Request struct {
 	// Period is "day" or "week", for retention, stickiness and lifecycle.
 	Period string
 
+	// Path names the page a heatmap is for. Required by heatmap, ignored by everything else.
+	Path string
+
+	// Variant narrows a heatmap to one arm of an experiment. Empty means every arm together,
+	// which is the right default: a page with no experiment running has one arm named "".
+	Variant string
+
+	// Viewport picks the width band to draw — 600, 1024, or 0 for the widest. Clicks are only
+	// comparable within a band, because a band is a layout.
+	Viewport int32
+
 	Limit int
 }
 
@@ -124,6 +140,7 @@ type Result struct {
 	Retention  []RetentionCohort  `json:"retention,omitempty"`
 	Stickiness []StickinessBucket `json:"stickiness,omitempty"`
 	Lifecycle  []LifecyclePoint   `json:"lifecycle,omitempty"`
+	Heatmap    *Heatmap           `json:"heatmap,omitempty"`
 
 	// RangeRelative marks a result whose meaning depends on the queried window rather than
 	// on all of history — lifecycle, where a long-standing visitor counts as new if their
@@ -176,7 +193,8 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 		return nil, fmt.Errorf("query: To must be after From")
 	}
 	switch req.Widget {
-	case WidgetFunnel, WidgetRetention, WidgetStickiness, WidgetLifecycle:
+	case WidgetFunnel, WidgetRetention, WidgetStickiness, WidgetLifecycle,
+		WidgetHeatmap, WidgetHeatmapPages:
 		// Left empty deliberately: for these, "" means ANY event, which is the usual
 		// question. Defaulting to $pageview here would make that impossible to express.
 	default:
@@ -217,6 +235,10 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 		return res, err
 	case WidgetTopEvents:
 		return e.topEvents(ctx, req)
+	case WidgetHeatmap:
+		return e.heatmap(ctx, req)
+	case WidgetHeatmapPages:
+		return e.heatmapPages(ctx, req)
 	case WidgetBreakdownByProperty:
 		if !propertyDims[req.Property] {
 			return nil, fmt.Errorf("query: %q is not a dimension this engine breaks down by", req.Property)

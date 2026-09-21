@@ -71,6 +71,17 @@ type Row struct {
 	Experiment string `parquet:"experiment,dict,zstd"`
 	Variant    string `parquet:"variant,dict,zstd"`
 
+	// Click position, and the window width it was measured in. Zero on everything that is
+	// not a click, which is nearly every row — and a column of zeros costs almost nothing
+	// once delta encoding and zstd have been at it.
+	//
+	// ClickX is ten-thousandths of the viewport width rather than a pixel, so the same click
+	// means the same thing on a phone and a desktop. ClickY is absolute pixels down the
+	// document, because vertical position does not scale with width.
+	ClickX   int32 `parquet:"click_x,delta"`
+	ClickY   int32 `parquet:"click_y,delta"`
+	Viewport int32 `parquet:"viewport,delta"`
+
 	Props string `parquet:"props,json,zstd"`
 }
 
@@ -85,6 +96,7 @@ func RowOf(e *event.Event) Row {
 		Device: e.Device, Browser: e.Browser, OS: e.OS,
 		Platform: e.Platform, AppVersion: e.AppVersion, Country: e.Country,
 		Experiment: e.Experiment, Variant: e.Variant,
+		ClickX: e.ClickX, ClickY: e.ClickY, Viewport: e.Viewport,
 		Props: e.Props,
 	}
 }

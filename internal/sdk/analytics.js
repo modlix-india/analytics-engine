@@ -11,7 +11,8 @@
  *
  *   <script async src="https://analytics.example/a.js"
  *           data-autocapture="true" data-pageviews="true"
- *           data-pageleaves="true" data-consent="required"></script>
+ *           data-pageleaves="true" data-heatmaps="false"
+ *           data-consent="required"></script>
  *
  * Public surface, through the queue stub the snippet installs as window.mlx:
  *
@@ -48,6 +49,10 @@
 	var wantPageviews = flag('pageviews', true);
 	var wantPageleaves = flag('pageleaves', true);
 	var wantAutocapture = flag('autocapture', true);
+	// Off unless the app asks. Every click on the page is one event, where autocapture is
+	// only the labelled ones — so this multiplies an app's event volume by however clicky its
+	// pages are, and that is a decision somebody should make on purpose.
+	var wantHeatmaps = flag('heatmaps', false);
 	var consentRequired = script.getAttribute('data-consent') === 'required';
 
 	// Opted out until told otherwise, whenever consent is required. The safe direction:
@@ -160,11 +165,16 @@
 		send(batch, beacon);
 	}
 
-	function record(name, props, label) {
+	function record(name, props, label, where) {
 		if (!allowed || !name) return;
 
 		var e = { e: name, t: now() };
 		if (label) e.l = label;
+		if (where) {
+			e.x = where.x;
+			e.y = where.y;
+			e.w = where.w;
+		}
 		if (pageName) e.g = pageName;
 		// The URL of THIS event, which in a single-page app is not the URL the batch was
 		// opened with.
@@ -214,18 +224,27 @@
 
 	/* ---- autocapture -------------------------------------------------------------- */
 
-	// Only elements carrying data-analytics-label, which is what the platform's
-	// `analyticsLabel` component property emits.
+	// Two different things ride on one listener, and they are deliberately separate events.
 	//
-	// Deliberately narrower than the vendor default of capturing every click and deriving
-	// a name from the DOM. Those names change whenever the markup does, so a funnel built
-	// on them breaks on a redesign with no error; and the text of a clicked element can
-	// carry a person's own data into an event name. A label is a decision somebody made.
+	// `click` is autocapture: only elements carrying data-analytics-label, which is what the
+	// platform's `analyticsLabel` component property emits. Narrower than the vendor default
+	// of capturing every click and deriving a name from the DOM — those names change whenever
+	// the markup does, so a funnel built on them breaks on a redesign with no error, and the
+	// text of a clicked element can carry a person's own data into an event name. A label is
+	// a decision somebody made.
+	//
+	// `$click` is the heatmap's raw material: every click anywhere, carrying where it landed
+	// and nothing about what it hit. Keeping them apart means switching heatmaps on cannot
+	// change what the funnel or the event list say.
 	function watchClicks() {
-		if (!wantAutocapture) return;
+		if (!wantAutocapture && !wantHeatmaps) return;
+
 		doc.addEventListener(
 			'click',
 			function (ev) {
+				if (wantHeatmaps) record('$click', null, null, positionOf(ev));
+				if (!wantAutocapture) return;
+
 				var el = ev.target;
 				while (el && el !== doc.body) {
 					if (el.getAttribute) {
@@ -240,6 +259,33 @@
 			},
 			true,
 		);
+	}
+
+	/**
+	 * Where a click landed, in the only units that survive being looked at later.
+	 *
+	 * x is a PROPORTION of the viewport width, in ten-thousandths, because a pixel abscissa
+	 * means the middle of a phone and the left gutter of a desktop — averaging the two draws a
+	 * picture of nowhere. y is absolute document pixels, because vertical position does not
+	 * scale with width: a header is a header at any size. The width itself travels too, so the
+	 * reader can band by layout rather than pretending every screen is the same.
+	 *
+	 * Uses pageX/pageY, which already include the scroll offset. clientY would put every click
+	 * in the top screenful of the page, and the map would look plausible.
+	 */
+	function positionOf(ev) {
+		var w = window.innerWidth || doc.documentElement.clientWidth || 0;
+		if (!w) return null;
+
+		var x = ev.pageX;
+		var y = ev.pageY;
+		if (typeof x !== 'number' || typeof y !== 'number') return null;
+
+		return {
+			x: Math.max(0, Math.min(10000, Math.round((x / w) * 10000))),
+			y: Math.max(0, Math.round(y)),
+			w: Math.round(w),
+		};
 	}
 
 	/* ---- the public queue ---------------------------------------------------------- */
