@@ -58,6 +58,7 @@ type request struct {
 
 	// Heatmap only: the page, the experiment arm, and the width band to draw.
 	Path     string `json:"path"`
+	Page     string `json:"page"`
 	Variant  string `json:"variant"`
 	Viewport int32  `json:"viewport"`
 
@@ -120,7 +121,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		From: from, To: to, Timezone: req.Timezone,
 		Event: req.Event, Property: req.Property,
 		Steps: req.Steps, WindowHours: req.WindowHours, Period: req.Period,
-		Path: req.Path, Variant: req.Variant, Viewport: req.Viewport,
+		Path: req.Path, Page: req.Page, Variant: req.Variant, Viewport: req.Viewport,
 		Limit: req.Limit,
 	})
 	if err != nil {

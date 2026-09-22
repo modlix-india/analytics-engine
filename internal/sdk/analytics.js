@@ -59,6 +59,20 @@
 	// a page that fails to ask has measured nobody, rather than everybody.
 	var allowed = !consentRequired;
 
+	/**
+	 * Being LOOKED AT rather than visited.
+	 *
+	 * The heatmap viewer frames a page to draw its clicks over it, and asks for that page
+	 * as-is with `modlixDesign` so that page routing does not serve a different arm. A page
+	 * opened that way is somebody reading their own numbers, and counting it would add to
+	 * the very figures they are reading — a page would gain a view every time anyone looked
+	 * at its heatmap, and the busiest page would be the one most often inspected.
+	 *
+	 * Read from the URL, not from a message: the frame is already loading by the time a
+	 * message could arrive, and the first page view is the one that matters.
+	 */
+	var design = /[?&]modlixDesign=(?!false|0)/.test(location.search);
+
 	var pageName = script.getAttribute('data-page') || '';
 	var experiment = '';
 	var variant = '';
@@ -166,7 +180,7 @@
 	}
 
 	function record(name, props, label, where) {
-		if (!allowed || !name) return;
+		if (design || !allowed || !name) return;
 
 		var e = { e: name, t: now() };
 		if (label) e.l = label;
@@ -194,16 +208,54 @@
 
 	/* ---- page views -------------------------------------------------------------- */
 
-	var lastPath = null;
+	var lastView = null;
+
+	/**
+	 * What counts as "the same view".
+	 *
+	 * The path WITHOUT the query, because that is exactly what is stored: the server
+	 * keeps `EscapedPath()` and mines the query only for campaign parameters. Keying
+	 * on the query as well counted a filter change as a second view of one page --
+	 * which the comment here had always said must not happen, while the code did it.
+	 *
+	 * And the page NAME, because an application can serve two different pages at one
+	 * address. A/B page routing does exactly that, and without the name the second
+	 * arm was never counted as a view at all.
+	 */
+	function viewKey() {
+		return location.pathname + '\n' + pageName;
+	}
 
 	function pageview() {
 		if (!wantPageviews) return;
-		var here = location.pathname + location.search;
-		// A single-page app replaces state more often than it navigates; without this a
-		// filter change would count as a page view.
-		if (here === lastPath) return;
-		lastPath = here;
+		var here = viewKey();
+		if (here === lastView) return;
+		lastView = here;
 		record('pageview', null, null);
+	}
+
+	/**
+	 * The page name arriving after the view it belongs to.
+	 *
+	 * An application knows where it is some milliseconds after the browser does, so
+	 * the arrival view is often recorded before `mlx('page', ...)` — and on a site
+	 * that asks for consent, always: the view is held until the visitor answers, and
+	 * the answer can reach us first. Sending a second, named view would double every
+	 * arrival. Naming the one already queued is not a second event: it has not been
+	 * sent. Only if the batch has already flushed is the name lost, and that is a
+	 * two-second window.
+	 */
+	function nameQueuedViews() {
+		var named = false;
+		for (var i = 0; i < queue.length; i++) {
+			if (queue[i].e === 'pageview' && !queue[i].g) {
+				queue[i].g = pageName;
+				named = true;
+			}
+		}
+		// The view it belongs to is accounted for, so `pageview()` must not treat the
+		// new name as a new view.
+		if (named) lastView = viewKey();
 	}
 
 	function watchNavigation() {
@@ -288,6 +340,62 @@
 		};
 	}
 
+	/* ---- being looked at ----------------------------------------------------------- */
+
+	/**
+	 * Tell an embedder how tall this document is.
+	 *
+	 * The heatmap viewer frames the measured page and draws clicks over it on a canvas of its
+	 * own. It has to make the frame as tall as the whole page: a frame that scrolls slides the
+	 * page out from under a canvas that cannot follow, and every blob then sits on the wrong
+	 * thing. But it cannot MEASURE the page — it is another origin, and that is the whole
+	 * point of the same-origin policy.
+	 *
+	 * So the page says. This is the one script that is already on both sides of that boundary.
+	 * Height is the only thing sent, it is the document's own layout rather than anything
+	 * about the person reading it, and it is sent only when actually framed — so an ordinary
+	 * visit posts nothing at all. Deliberately NOT gated on consent: there is nothing here to
+	 * consent to, and an unanswered banner would otherwise leave the viewer with a guess.
+	 */
+	function reportHeightWhenFramed() {
+		var parent = window.parent;
+		if (!parent || parent === window) return;
+
+		var last = 0;
+		var tell = function () {
+			var d = doc.documentElement;
+			var h = Math.max(
+				d ? d.scrollHeight : 0,
+				doc.body ? doc.body.scrollHeight : 0,
+			);
+			if (!h || h === last) return;
+			last = h;
+			try {
+				// The embedder checks the origin; naming it here would mean knowing it, and a
+				// page can be framed from anywhere it has allowed.
+				parent.postMessage({ mlx: 'height', height: h }, '*');
+			} catch (e) {
+				/* Analytics must never break the page it measures. */
+			}
+		};
+
+		tell();
+		addEventListener('load', tell);
+		addEventListener('resize', tell);
+		// A page grows after it arrives: fonts land, images decode, a consent bar is answered
+		// and disappears. A ResizeObserver on the root catches all of it in one line, and the
+		// timers cover the browsers that have none.
+		if (typeof ResizeObserver === 'function' && doc.documentElement) {
+			try {
+				new ResizeObserver(tell).observe(doc.documentElement);
+			} catch (e) {
+				/* fall through to the timers */
+			}
+		}
+		setTimeout(tell, 500);
+		setTimeout(tell, 2000);
+	}
+
 	/* ---- the public queue ---------------------------------------------------------- */
 
 	function handle(args) {
@@ -295,6 +403,10 @@
 		if (op === 'capture') record(args[1], args[2], null);
 		else if (op === 'page') {
 			pageName = args[1] || '';
+			// Name the view this belongs to before deciding whether there is a new one:
+			// an app that has just told us where we are is describing the view already
+			// recorded, not announcing another.
+			nameQueuedViews();
 			// A page identity arriving after load means the app has just told us where
 			// we are, which is the first moment a page view is meaningful.
 			pageview();
@@ -307,7 +419,7 @@
 				allowed = true;
 				// The view that was refused before consent. Without this, a visitor who
 				// accepts on arrival is never counted as having arrived.
-				lastPath = null;
+				lastView = null;
 				pageview();
 			} else if (!granted) {
 				allowed = false;
@@ -324,6 +436,7 @@
 
 	watchNavigation();
 	watchClicks();
+	reportHeightWhenFramed();
 	pageview();
 
 	addEventListener(

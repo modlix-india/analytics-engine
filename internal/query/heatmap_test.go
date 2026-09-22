@@ -16,6 +16,14 @@ func click(ts time.Time, path string, x, y, vw int32, variant string) store.Row 
 	}
 }
 
+// clickOn is a click that also carries the page the application actually served, which is
+// what tells two A/B arms at one address apart.
+func clickOn(ts time.Time, path, page string, x, y, vw int32) store.Row {
+	r := click(ts, path, x, y, vw, "")
+	r.Page = page
+	return r
+}
+
 func heatmapOf(t *testing.T, dir string, req Request) *Heatmap {
 	t.Helper()
 	req.Widget = WidgetHeatmap
@@ -155,6 +163,95 @@ func TestHeatmapNeedsAPath(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a heatmap with no path was accepted; it would have scanned every page at once")
+	}
+}
+
+// The bug this whole change exists for. Page routing serves two different pages at one
+// address, so a heatmap keyed on the address draws both of them over one of their two
+// layouts — and it looks like a working heatmap, which is what makes it expensive.
+func TestHeatmapSeparatesTwoPagesAtOneAddress(t *testing.T) {
+	at := utc(2026, 9, 20, 10, 0)
+	window := Request{From: utc(2026, 9, 20, 0, 0), To: utc(2026, 9, 21, 0, 0)}
+	dir := fixture(t, []store.Row{
+		clickOn(at, "/", "home", 1000, 100, 1440),
+		clickOn(at, "/", "home", 1000, 100, 1440),
+		clickOn(at, "/", "homeTwo", 8000, 900, 1440),
+	})
+
+	byPage := window
+	byPage.Page = "home"
+	if got := heatmapOf(t, dir, byPage); got.Clicks != 2 {
+		t.Errorf("home has %d clicks, want 2 — the arms are being averaged together", got.Clicks)
+	}
+
+	other := window
+	other.Page = "homeTwo"
+	if got := heatmapOf(t, dir, other); got.Clicks != 1 {
+		t.Errorf("homeTwo has %d clicks, want 1", got.Clicks)
+	}
+
+	// And the address on its own still answers for everything at it, which is what a row
+	// recorded before the application reported its page name looks like.
+	byPath := window
+	byPath.Path = "/"
+	if got := heatmapOf(t, dir, byPath); got.Clicks != 3 {
+		t.Errorf("the address has %d clicks, want all 3", got.Clicks)
+	}
+}
+
+// One page reached at two addresses — a campaign landing URL and the page it stands for —
+// is one layout, so its clicks belong in one map rather than two half-maps.
+func TestHeatmapGathersOnePageAcrossAddresses(t *testing.T) {
+	at := utc(2026, 9, 20, 10, 0)
+	dir := fixture(t, []store.Row{
+		clickOn(at, "/", "home", 1000, 100, 1440),
+		clickOn(at, "/spring-sale", "home", 1000, 100, 1440),
+	})
+
+	hm := heatmapOf(t, dir, Request{
+		Page: "home", From: utc(2026, 9, 20, 0, 0), To: utc(2026, 9, 21, 0, 0),
+	})
+	if hm.Clicks != 2 {
+		t.Errorf("counted %d clicks for home, want 2 across both addresses", hm.Clicks)
+	}
+}
+
+// The picker has to be able to OFFER the arms separately, or there is no way to ask for one.
+func TestHeatmapPagesListsPagesNotAddresses(t *testing.T) {
+	at := utc(2026, 9, 20, 10, 0)
+	dir := fixture(t, []store.Row{
+		clickOn(at, "/", "home", 1, 1, 1440),
+		clickOn(at, "/", "home", 2, 2, 1440),
+		clickOn(at, "/", "homeTwo", 3, 3, 1440),
+		// No page name at all: an old row, which can only be offered by its address.
+		click(at, "/legacy", 1, 1, 1440, ""),
+	})
+
+	res, err := New(dir).Query(context.Background(), Request{
+		Widget: WidgetHeatmapPages, Site: "s.example",
+		From: utc(2026, 9, 20, 0, 0), To: utc(2026, 9, 21, 0, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (home, homeTwo, /legacy): %+v", len(res.Rows), res.Rows)
+	}
+	if res.Rows[0].Label != "home" || res.Rows[0].Page != "home" || res.Rows[0].Events != 2 {
+		t.Errorf("first row = %+v, want home/home with 2", res.Rows[0])
+	}
+	// The address travels with the page, because the caller has to open it somewhere.
+	if res.Rows[0].Path != "/" {
+		t.Errorf("home has path %q, want / — the caller needs an address to frame", res.Rows[0].Path)
+	}
+	var legacy *Row
+	for i := range res.Rows {
+		if res.Rows[i].Label == "/legacy" {
+			legacy = &res.Rows[i]
+		}
+	}
+	if legacy == nil || legacy.Page != "" {
+		t.Errorf("a row with no page name must still be offered by its address: %+v", res.Rows)
 	}
 }
 

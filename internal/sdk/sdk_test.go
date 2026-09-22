@@ -3,6 +3,7 @@ package sdk
 import (
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -43,5 +44,24 @@ func TestServesTheScriptWithAValidatorAndCORS(t *testing.T) {
 	}
 	if rec2.Body.Len() != 0 {
 		t.Errorf("304 carried %d bytes of body", rec2.Body.Len())
+	}
+}
+
+// TestTheBeaconBehaves runs the script's own tests.
+//
+// The behaviour under test is JavaScript, so its tests are too; this is the bridge that
+// keeps `go test ./...` the one command that checks the repo. Skipped rather than failed
+// when node is absent: a Go toolchain is the only thing this project has ever required to
+// build, and adding a second one as a hard dependency to run the suite would be a tax on
+// everyone who touches the Go side.
+func TestTheBeaconBehaves(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; analytics_test.mjs not run")
+	}
+
+	out, err := exec.Command(node, "--test", "analytics_test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("the beacon's own tests failed:\n%s", out)
 	}
 }

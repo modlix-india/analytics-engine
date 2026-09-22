@@ -111,8 +111,14 @@ type Request struct {
 	// Period is "day" or "week", for retention, stickiness and lifecycle.
 	Period string
 
-	// Path names the page a heatmap is for. Required by heatmap, ignored by everything else.
+	// Path names the ADDRESS a heatmap is for. Used when no Page is given, which is what an
+	// event recorded before the application reported its own page name looks like.
 	Path string
+
+	// Page names the page a heatmap is for, and takes precedence over Path. An address is
+	// not a page: routing serves two different definitions at one URL, so a heatmap keyed on
+	// the address draws both arms of an A/B test over one of their two layouts.
+	Page string
 
 	// Variant narrows a heatmap to one arm of an experiment. Empty means every arm together,
 	// which is the right default: a page with no experiment running has one arm named "".
@@ -129,6 +135,12 @@ type Row struct {
 	Label    string `json:"label"`
 	Events   int64  `json:"events"`
 	Visitors uint64 `json:"visitors"`
+
+	// Page and Path are set only by the heatmap page list, where one label is not enough to
+	// act on: the page says which clicks to ask for, and the path says where to open it. A
+	// page routed to from an address is not the same thing as the address.
+	Page string `json:"page,omitempty"`
+	Path string `json:"path,omitempty"`
 }
 
 type Result struct {
