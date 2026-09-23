@@ -18,7 +18,12 @@ import (
 	"syscall"
 	"time"
 
+	"fmt"
 	"github.com/modlix-india/analytics-engine/internal/compact"
+	"net"
+	"net/http"
+	"strings"
+
 	"github.com/redis/go-redis/v9"
 
 	"github.com/modlix-india/analytics-engine/internal/config"
@@ -38,10 +43,46 @@ import (
 var version = "dev"
 
 func main() {
+	// `engine -healthcheck` asks the engine already running in this container whether it is
+	// well, and exits 0 or 1. It exists because the runtime image is distroless: there is no
+	// shell, no curl and no wget in it, so a Docker HEALTHCHECK has exactly one executable to
+	// work with — this one. Without it the compose healthcheck would have to be dropped, and
+	// "up" would mean the process started rather than that it can serve.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		if err := healthcheck(); err != nil {
+			slog.Error("unhealthy", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// healthcheck probes this container's own listener.
+//
+// Over the loopback and the configured port, so it follows ANALYTICS_LISTEN_ADDR rather than
+// assuming 8080 and reporting a healthy container that nothing can reach.
+func healthcheck() error {
+	addr := config.ListenAddr()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("listen address %q: %w", addr, err)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("/healthz answered %d", res.StatusCode)
+	}
+	return nil
 }
 
 func run() error {
@@ -254,16 +295,62 @@ func sharedCache(cfg config.Config, log *slog.Logger) modlix.Shared {
 		log.Warn("no ANALYTICS_REDIS_ADDR: site resolutions are cached per node and no eviction reaches them")
 		return modlix.NewMemoryShared()
 	}
+	opts, err := redisOptions(cfg)
+	if err != nil {
+		// A malformed address is a deployment mistake, and the alternative is a node that
+		// silently caches per-process and never hears an eviction.
+		log.Error("ANALYTICS_REDIS_ADDR could not be parsed; falling back to a per-node cache",
+			"addr", cfg.RedisAddr, "err", err)
+		return modlix.NewMemoryShared()
+	}
+
 	return &modlix.RedisShared{
-		Client: redis.NewClient(&redis.Options{
-			Addr:     cfg.RedisAddr,
-			Password: cfg.RedisPassword,
-			DB:       cfg.RedisDB,
-		}),
+		Client: redis.NewClient(opts),
 		Prefix: cfg.RedisPrefix,
 		TTL:    cfg.ResolveTTL,
 		Log:    log,
 	}
+}
+
+// redisOptions turns the configured address into a client, with TLS where the address asks
+// for it.
+//
+// The platform's Redis in every OCI environment is a managed instance reached over
+// `rediss://` — TLS is not optional there, it is the only thing the endpoint speaks. Built
+// with a bare Addr and no TLSConfig, as this was, the client cannot connect at all: the
+// resolver falls back to caching per node and hears no eviction, so a URL change leaves some
+// nodes serving the old site indefinitely. Nothing in the logs says "TLS"; it reads as a
+// connection that will not come up.
+//
+// A bare `host:6379` keeps meaning plaintext, unlike the S3 endpoint a few lines away in
+// config.go where a bare hostname implies TLS. The two defaults differ because the
+// populations do: an S3 endpoint without a scheme is a real provider on the internet, while
+// a Redis address without one is the local or in-VCN instance this has always been pointed
+// at, and flipping it would break every existing deployment on upgrade.
+func redisOptions(cfg config.Config) (*redis.Options, error) {
+	if !strings.Contains(cfg.RedisAddr, "://") {
+		return &redis.Options{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPassword,
+			DB:       cfg.RedisDB,
+		}, nil
+	}
+
+	// ParseURL understands `rediss://` and sets a TLSConfig for it, along with any user,
+	// password and database index carried in the URL.
+	opts, err := redis.ParseURL(cfg.RedisAddr)
+	if err != nil {
+		return nil, err
+	}
+	// The separate variables win when set, because the deployed configuration keeps the
+	// password out of the URL — the same split the Java side uses.
+	if cfg.RedisPassword != "" {
+		opts.Password = cfg.RedisPassword
+	}
+	if cfg.RedisDB != 0 {
+		opts.DB = cfg.RedisDB
+	}
+	return opts, nil
 }
 
 func newLogger(level string) *slog.Logger {

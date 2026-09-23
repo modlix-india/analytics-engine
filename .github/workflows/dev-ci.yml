@@ -1,0 +1,112 @@
+name: dev-ci
+
+# Mirrors the nocode-saas and whatsapp-bridge pipelines. Three differences, all forced by what
+# this service is.
+#
+# 1. **Not blue-green.** Every Java service here overlaps old and new for a moment. This one owns
+#    a write-ahead log and a local Parquet tier on disk, and two processes over one data
+#    directory corrupt both — the same reason whatsapp-bridge is a singleton, and the same
+#    category keepup.sh already uses for config, eureka and gateway. The gap is a second or two
+#    of refused ingest, which the beacon retries; the alternative is a data directory two
+#    processes disagree about.
+#
+# 2. **It runs on the analytics VM, not the app VM.** It is stateful and the app VMs are
+#    redeployed constantly; the analytics box already exists, has the disk, and is where the
+#    Cloudflare worker already points (`ENGINE_ORIGIN = https://engine-dev.modlix.com`).
+#
+# 3. **`go test` gates the image.** Two of the things this service decides — what counts as a
+#    page view, and which page a click belongs to — fail silently when they regress: the
+#    numbers still arrive, they are just wrong. The suite includes the beacon's own tests,
+#    which run under node; ubuntu-latest has one, so they are not skipped here.
+on:
+  push:
+    branches:
+      - oci-development
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.github/workflows/dev-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      OCIR_HOST: ocir.us-ashburn-1.oci.oraclecloud.com
+      OCIR_REPO: ocir.us-ashburn-1.oci.oraclecloud.com/idfmutpuhiky/dev-analytics-engine
+
+    outputs:
+      image_tag: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - run: go vet ./...
+      # -race here and not on the deploy path: the ingest and query sides share the WAL and the
+      # store index across goroutines, and a data race there shows up as a wrong number rather
+      # than a crash.
+      - run: go test -race ./...
+
+      # A plain `docker login` as `idfmutpuhiky/admin@modlix.com`. The secret names are the
+      # platform's, not descriptions: OCI_NON_PROD_CLI_AUTH_TOKEN is nothing to do with the OCI
+      # CLI, it is that login's password, and "NON_PROD" is tenancy-wide — an auth token is scoped
+      # to the user, so the same one pushes to the prod compartment too. Kept as-is so all the
+      # pipelines match; renamed here they would just look like different credentials.
+      - run: |
+          echo "${{ secrets.OCI_NON_PROD_CLI_AUTH_TOKEN }}" | docker login $OCIR_HOST \
+            -u "${{ secrets.OCI_NON_PROD_DOCKER_USER_NAME }}" \
+            --password-stdin
+
+      # --platform is explicit because the Dockerfile does not pin GOARCH: it builds for whatever
+      # the builder is, which silently produces an unrunnable image the day a runner or a host
+      # moves to Ampere.
+      - run: |
+          docker build --platform linux/amd64 \
+                       --build-arg VERSION=${{ github.sha }} \
+                       -t $OCIR_REPO:${{ github.sha }} \
+                       -t $OCIR_REPO:latest \
+                       -f Dockerfile .
+          docker push $OCIR_REPO:${{ github.sha }}
+          docker push $OCIR_REPO:latest
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+
+    steps:
+      # The immutable tag, not :latest. keepup.sh writes it into the compose env file and brings
+      # the container up on exactly that digest, so what is running is answerable from the
+      # commit — and a re-run of an older workflow rolls back rather than redeploying whatever
+      # :latest happens to be.
+      # The host by its VCN DNS name, not an IP in a secret.
+      #
+      # The runner is self-hosted and IS the jumphost, inside this VCN at 172.16.0.107 — the
+      # same 172.16.0.0/24 subnet all three analytics VMs sit in, prod included, because a
+      # compartment is an IAM boundary and not a network one. So the VCN resolver answers for
+      # these names and the address never has to be written down.
+      #
+      # The other pipelines pass an IP through a secret. That is habit rather than secrecy: an
+      # RFC1918 address inside a private VCN protects nothing by being hidden, it is already in
+      # oci-config and readable from the CLI, and a secret goes stale silently the day an
+      # instance is replaced. A name that the resolver owns fails loudly instead.
+      #
+      # **dev-external.key, not dev-internal.key.** Every other pipeline in the platform uses
+      # the internal pair, because the app VMs were provisioned with it. These analytics boxes
+      # came up separately in the PostHog days and carry the external pair instead. Copying the
+      # line from a nocode-saas workflow gets you a permission denial on the first deploy.
+      - run: |
+          ssh -o StrictHostKeyChecking=accept-new \
+              -i /home/ubuntu/keys/dev-external.key \
+              opc@dev-analytics.sub10150624020.modlixvcn.oraclevcn.com \
+            "bash /home/opc/scripts/keepup.sh deploy analytics-engine \
+               ocir.us-ashburn-1.oci.oraclecloud.com/idfmutpuhiky/dev-analytics-engine:${{ needs.build.outputs.image_tag }} \
+               2>&1 | tee -a /var/log/keepup.log"

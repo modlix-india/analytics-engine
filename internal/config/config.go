@@ -234,6 +234,16 @@ func Load() (Config, error) {
 	return c, nil
 }
 
+// ListenAddr is the address the engine serves on, read without loading the rest of the
+// configuration.
+//
+// The healthcheck sub-command needs this and nothing else, and it must not go through Load():
+// Load validates the whole configuration and fails when a required variable is missing, which
+// would make an unhealthy answer indistinguishable from a misconfigured one.
+func ListenAddr() string {
+	return envStr("ANALYTICS_LISTEN_ADDR", ":8080")
+}
+
 // deriveSSL decides whether to speak TLS to the endpoint.
 //
 // An explicit ANALYTICS_S3_USE_SSL wins. Otherwise the endpoint's own scheme decides, and a
