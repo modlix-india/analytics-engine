@@ -104,6 +104,31 @@ func TestFunnelRejectsDegenerateRequests(t *testing.T) {
 	}
 }
 
+// A window longer than a day is refused rather than answered.
+//
+// Visitor identity rotates at UTC midnight, so a two-day window cannot find a two-day
+// conversion — it reports it as a drop-off. Answering anyway would be worse than refusing,
+// because the number looks ordinary.
+func TestFunnelRefusesAWindowLongerThanADay(t *testing.T) {
+	e := New(t.TempDir())
+	now := time.Now()
+
+	if _, err := e.Query(context.Background(), Request{
+		Widget: WidgetFunnel, Site: "s", Steps: []string{"view", "buy"}, WindowHours: 48,
+		From: now.Add(-72 * time.Hour), To: now,
+	}); err == nil {
+		t.Error("a 48-hour funnel window was accepted; it cannot be answered across a salt rotation")
+	}
+
+	// The boundary itself is legal: a day is exactly what the identity lasts.
+	if _, err := e.Query(context.Background(), Request{
+		Widget: WidgetFunnel, Site: "s", Steps: []string{"view", "buy"}, WindowHours: 24,
+		From: now.Add(-48 * time.Hour), To: now,
+	}); err != nil {
+		t.Errorf("a 24-hour window was refused: %v", err)
+	}
+}
+
 func TestRetentionCohorts(t *testing.T) {
 	rows := []store.Row{
 		// a: days 1, 3 — cohort day 1, returns at offset 2.

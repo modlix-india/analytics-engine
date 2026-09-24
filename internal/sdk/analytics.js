@@ -53,6 +53,10 @@
 	// only the labelled ones — so this multiplies an app's event volume by however clicky its
 	// pages are, and that is a decision somebody should make on purpose.
 	var wantHeatmaps = flag('heatmaps', false);
+	// On by default, unlike heatmaps: it is at most one extra event per page view, where a
+	// heatmap is one per click. Nothing it records is about the person — how far down a
+	// document somebody got is a fact about the document.
+	var wantScroll = flag('scroll', true);
 	var consentRequired = script.getAttribute('data-consent') === 'required';
 
 	// Opted out until told otherwise, whenever consent is required. The safe direction:
@@ -179,20 +183,35 @@
 		send(batch, beacon);
 	}
 
-	function record(name, props, label, where) {
+	/*
+	 * `at` names the view an event belongs to, when that is not the view the page is showing.
+	 *
+	 * Only the scroll report needs it, and it needs it absolutely: a single-page app reports
+	 * the depth of the page it is LEAVING, from inside the navigation that has already changed
+	 * `location`. Without this the first page's depth is filed under the second page's URL —
+	 * silently, plausibly, and in a way that makes the second page look like the one people
+	 * read to the end.
+	 */
+	function record(name, props, label, where, at) {
 		if (design || !allowed || !name) return;
 
 		var e = { e: name, t: now() };
 		if (label) e.l = label;
 		if (where) {
-			e.x = where.x;
-			e.y = where.y;
-			e.w = where.w;
+			if (where.x !== undefined) e.x = where.x;
+			if (where.y !== undefined) e.y = where.y;
+			if (where.w !== undefined) e.w = where.w;
+			if (where.i !== undefined) e.i = where.i;
+			if (where.d !== undefined) e.d = where.d;
+			if (where.h !== undefined) e.h = where.h;
+			if (where.dh !== undefined) e.dh = where.dh;
 		}
-		if (pageName) e.g = pageName;
+		var page = at && at.g !== undefined ? at.g : pageName;
+		if (page) e.g = page;
 		// The URL of THIS event, which in a single-page app is not the URL the batch was
-		// opened with.
-		e.u = location.href;
+		// opened with — nor, for an event about a view that has just ended, the URL the
+		// browser is showing now.
+		e.u = at && at.u ? at.u : location.href;
 		if (props && typeof props === 'object') {
 			try {
 				e.p = JSON.stringify(props);
@@ -230,8 +249,22 @@
 		if (!wantPageviews) return;
 		var here = viewKey();
 		if (here === lastView) return;
+
+		// The view that is ending gets its scroll report first, so the two events arrive in
+		// the order they happened and the report belongs to the page it describes: `record`
+		// stamps the CURRENT location onto every event, so a report sent after the new view
+		// would be filed under the new page.
+		if (lastView !== null) reportScroll();
+
 		lastView = here;
+		scrollReach = 0;
+		scrollReported = false;
 		record('pageview', null, null);
+		// Re-measured against the new page's own layout, not carried over from the old one.
+		if (wantScroll) {
+			scrollReach = scrollReachNow();
+			scrollView = { u: location.href, g: pageName };
+		}
 	}
 
 	/**
@@ -256,6 +289,9 @@
 		// The view it belongs to is accounted for, so `pageview()` must not treat the
 		// new name as a new view.
 		if (named) lastView = viewKey();
+		// The scroll report for that same view has not been sent either, and it is filed
+		// under the name the view had when it began.
+		if (scrollView && !scrollView.g) scrollView.g = pageName;
 	}
 
 	function watchNavigation() {
@@ -272,6 +308,159 @@
 		wrap('pushState');
 		wrap('replaceState');
 		addEventListener('popstate', function () { setTimeout(pageview, 0); });
+	}
+
+	/* ---- forms being sent ----------------------------------------------------------- */
+
+	/*
+	 * A submitted form, as `form_submit` with the form's own label and nothing else.
+	 *
+	 * The gap this closes: autocapture listens on `click`, so a form sent with the Enter key,
+	 * or by the page's own logic after validation, produced no event at all. On a small
+	 * business site the contact form IS the conversion, and it was the one thing that could
+	 * not be counted without somebody wiring an event by hand.
+	 *
+	 * The label is `data-analytics-label`, then `name`, then `id` — a name somebody chose,
+	 * never one derived from what the form says. Deriving it from visible text is how a
+	 * person's own words end up in an event name, and it changes whenever the markup does.
+	 *
+	 * NO FIELD VALUES, ever, and none of this reads `elements` at all. A submit handler is
+	 * the single easiest place in an analytics script to collect an email address by accident.
+	 */
+	function watchForms() {
+		if (!wantAutocapture) return;
+
+		doc.addEventListener(
+			'submit',
+			function (ev) {
+				var f = ev.target;
+				if (!f || !f.getAttribute) return;
+				var label =
+					f.getAttribute('data-analytics-label') ||
+					f.getAttribute('name') ||
+					f.getAttribute('id') ||
+					'form';
+				record('form_submit', null, label);
+			},
+			// Capture, so a handler that stops propagation to implement its own submission
+			// does not also stop the measurement.
+			true,
+		);
+	}
+
+	/* ---- how far down the page people got ------------------------------------------ */
+
+	/*
+	 * One report per view, sent when the view ends.
+	 *
+	 * Not a threshold event per 25% crossed, which is how this is usually done: that is four
+	 * or five events per page view where this is one, it fixes the thresholds at whatever we
+	 * chose today, and it cannot answer "how far did the median person get" at all. Recording
+	 * the maximum reached and bucketing it at READ time keeps every question open, including
+	 * the ones the brief asks for later — a drop band is a histogram of this same number at a
+	 * finer resolution, and no new capture.
+	 *
+	 * A separate `$scroll` event rather than fields on `pageleave`, following `$click`: a page
+	 * can turn `pageleaves` off, and switching one measurement on must not change what another
+	 * one says.
+	 */
+	// The deepest point reached, in PIXELS down the document, not as a percentage.
+	//
+	// A percentage measured while the page was short stays at its old value forever once the
+	// page grows: a 700px page read in full is 100%, and when an image decodes and the page
+	// becomes 5000px the maximum is still 100 although the visitor has seen a seventh of it.
+	// Pixels are monotonic in the thing actually being measured, and the percentage is worked
+	// out at the end against the height the document finally had.
+	var scrollReach = 0;
+	var scrollReported = false;
+	var scrollTicking = false;
+
+	// The view the current reach belongs to, captured when that view began. `location` has
+	// already moved on by the time a single-page app reports the page it is leaving.
+	var scrollView = null;
+
+	function viewportHeight() {
+		return window.innerHeight || (doc.documentElement ? doc.documentElement.clientHeight : 0) || 0;
+	}
+
+	function documentHeight() {
+		var d = doc.documentElement;
+		return Math.max(
+			d ? d.scrollHeight : 0,
+			doc.body ? doc.body.scrollHeight : 0,
+			d ? d.offsetHeight : 0,
+		);
+	}
+
+	/*
+	 * How far down the document the BOTTOM of the window currently is, in pixels.
+	 *
+	 * The bottom rather than the top, because the question is what somebody could have SEEN.
+	 * Measuring the top reports nothing for a page that fits on one screen and was read in
+	 * full, which is the most common page on a small site and the one most likely to be
+	 * redesigned on the strength of the number.
+	 */
+	function scrollReachNow() {
+		var y = window.pageYOffset || (doc.documentElement ? doc.documentElement.scrollTop : 0) || 0;
+		return Math.max(0, y + viewportHeight());
+	}
+
+	function watchScroll() {
+		if (!wantScroll) return;
+
+		// A page shorter than the window was seen in full the moment it arrived, and nobody
+		// will ever scroll it. Measured after layout rather than on the first scroll event,
+		// because on such a page there is no first scroll event.
+		scrollReach = scrollReachNow();
+		scrollView = { u: location.href, g: pageName };
+
+		var onScroll = function () {
+			// Coalesced to one measurement per frame. Reading scrollHeight forces layout, and
+			// doing that on every scroll event is the classic way an analytics script becomes
+			// the reason a page feels slow.
+			if (scrollTicking) return;
+			scrollTicking = true;
+			var measure = function () {
+				scrollTicking = false;
+				var reach = scrollReachNow();
+				if (reach > scrollReach) scrollReach = reach;
+			};
+			if (typeof requestAnimationFrame === 'function') requestAnimationFrame(measure);
+			else setTimeout(measure, 100);
+		};
+
+		// Passive: this listener never calls preventDefault, and saying so is what keeps it
+		// off the critical path of a touch scroll.
+		addEventListener('scroll', onScroll, { passive: true });
+		addEventListener('resize', onScroll, { passive: true });
+	}
+
+	/*
+	 * Report the view that is ending, and arm the next one.
+	 *
+	 * Called from the page-view path as well as from pagehide, because a single-page app
+	 * navigating away ends a view without ending the document. Guarded so the two cannot both
+	 * report the same view: a visitor who navigates and then closes the tab would otherwise
+	 * send two reports for the second page and none for the first.
+	 */
+	function reportScroll() {
+		if (!wantScroll || scrollReported) return;
+		var h = documentHeight();
+		if (!h) return;
+		scrollReported = true;
+
+		// Against the height the document ENDED at. Capped, because a reach past the bottom is
+		// what an elastic overscroll on a phone produces and 104% is not a thing.
+		var pct = Math.round((scrollReach / h) * 100);
+		if (pct > 100) pct = 100;
+		if (pct < 0) pct = 0;
+
+		record('$scroll', null, null, {
+			d: pct,
+			h: viewportHeight(),
+			dh: h,
+			w: window.innerWidth || (doc.documentElement ? doc.documentElement.clientWidth : 0) || 0,
+		}, scrollView);
 	}
 
 	/* ---- autocapture -------------------------------------------------------------- */
@@ -337,7 +526,35 @@
 			x: Math.max(0, Math.min(10000, Math.round((x / w) * 10000))),
 			y: Math.max(0, Math.round(y)),
 			w: Math.round(w),
+			i: interactive(ev.target) ? 1 : 0,
 		};
+	}
+
+	/*
+	 * Whether the thing clicked does anything when clicked.
+	 *
+	 * One bit, and deliberately one bit: a position alone cannot say whether somebody pressed
+	 * a button or an image that looks like one, and "people keep clicking this and nothing
+	 * happens" is the single most actionable thing a click map can say. The richer version
+	 * would send a stable component identity, which is the structural advantage this platform
+	 * ought to have — but only `data-analytics-label` reaches the DOM today, and putting a key
+	 * on every rendered element is a separate decision with a page-weight cost.
+	 *
+	 * No text, no selector, no attributes: a boolean cannot carry somebody's own data into an
+	 * event, which is the property that makes this safe to switch on for every site.
+	 */
+	function interactive(el) {
+		if (!el || typeof el.closest !== 'function') return true;
+		try {
+			return !!el.closest(
+				'a,button,input,select,textarea,label,summary,' +
+					'[role=button],[role=link],[role=tab],[onclick],[tabindex]',
+			);
+		} catch (e) {
+			// An exotic target — an SVG node in an old browser — is assumed interactive.
+			// Guessing the other way would invent dead clicks that nobody can reproduce.
+			return true;
+		}
 	}
 
 	/* ---- being looked at ----------------------------------------------------------- */
@@ -436,12 +653,15 @@
 
 	watchNavigation();
 	watchClicks();
+	watchForms();
+	watchScroll();
 	reportHeightWhenFramed();
 	pageview();
 
 	addEventListener(
 		'pagehide',
 		function () {
+			reportScroll();
 			if (wantPageleaves) record('pageleave', null, null);
 			flush(true);
 		},
@@ -450,6 +670,11 @@
 
 	// Firefox does not fire pagehide on a background tab being discarded; this one it does.
 	addEventListener('visibilitychange', function () {
-		if (doc.visibilityState === 'hidden') flush(true);
+		if (doc.visibilityState === 'hidden') {
+			// Firefox does not fire pagehide on a background tab being discarded, so this is
+			// the last chance to say how far somebody got.
+			reportScroll();
+			flush(true);
+		}
 	});
 })();
