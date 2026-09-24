@@ -82,6 +82,22 @@ type Row struct {
 	ClickY   int32 `parquet:"click_y,delta"`
 	Viewport int32 `parquet:"viewport,delta"`
 
+	// How far down the page one view got, and the heights it was measured against. Zero on
+	// everything that is not a $scroll report, which is nearly every row.
+	//
+	// Stored raw rather than bucketed at 25/50/75/90/100. A bucket chosen at write time is the
+	// finest question this column can ever answer, and the brief already wants a finer one
+	// later: a drop band is a histogram of this same number at a higher resolution, and
+	// reading it that way costs nothing that is not already being read.
+	ScrollPct int32 `parquet:"scroll_pct,delta"`
+	ViewportH int32 `parquet:"viewport_h,delta"`
+	DocH      int32 `parquet:"doc_h,delta"`
+
+	// 1 when a click hit something that does anything, 0 when it did not, and absent on rows
+	// written before this existed. Absent and 0 are the same byte here, so the reader treats
+	// a page with no interactive column at all as unmeasured rather than as entirely dead.
+	Interactive int32 `parquet:"interactive,delta"`
+
 	Props string `parquet:"props,json,zstd"`
 }
 
@@ -97,7 +113,9 @@ func RowOf(e *event.Event) Row {
 		Platform: e.Platform, AppVersion: e.AppVersion, Country: e.Country,
 		Experiment: e.Experiment, Variant: e.Variant,
 		ClickX: e.ClickX, ClickY: e.ClickY, Viewport: e.Viewport,
-		Props: e.Props,
+		ScrollPct: e.ScrollPct, ViewportH: e.ViewportH, DocH: e.DocH,
+		Interactive: e.Interactive,
+		Props:       e.Props,
 	}
 }
 

@@ -995,12 +995,90 @@ Each ends in something runnable.
       signed-in client does not own — even where the analytics query itself is allowed. The
       pane therefore cannot show crumbco to a SYSTEM developer today.
 
-14. **Paths** — sequence to edge counts, with step and branching caps.
-14. **Correlation** — contingency tables, chi-squared with a Fisher fallback, Benjamini-Hochberg.
+14. **Visits, comparison, scroll depth, conversions and click friction** — the SiteZump
+    analytics brief, audited against what was actually built. *(done)*
+
+    Three things the brief asks for that nothing captured or answered, plus the correctness
+    work the audit turned up along the way.
+
+    **The session column had never been read.** It has been written on every row since the
+    first release and no widget consumed it, so `entryPages`, `exitPages`, `pagesPerVisit` and
+    `visitLength` cost one projection and the sort-merge that already existed — partitioned on
+    the session instead of the visitor. They are also the analyses the salt rotation does not
+    cost: a visit is minutes long and cannot straddle it.
+
+    The difficulty is entirely at the range edges. A visit still running when the range ends
+    has not left anywhere, and one already under way when it began did not arrive during it.
+    Scanning exactly `[from, to)` gets both wrong in the same direction and reports whatever
+    page people happen to be reading at midnight as the site's biggest leak. The scan is
+    widened by the beacon's 30-minute idle timeout at each end and those events only
+    classify — exact rather than approximate, because a session id provably cannot span a
+    longer gap.
+
+    **Comparison is in the engine, not the dashboard**, because "the previous period" is not a
+    fixed duration: a week containing a clock change is 169 hours, and subtracting a duration
+    from it starts the comparison an hour off midnight and shifts every column of the chart
+    against the day it is being compared to. Defined once against a real `time.Location`, every
+    widget and every future insight rule agrees. Rollup-backed widgets only — doubling a rollup
+    read is two more cheap scans, doubling a funnel is a second pass over raw Parquet.
+
+    **Scroll depth is one report per view, bucketed at read time.** Not an event per threshold
+    crossed: that is five times the events, it fixes the thresholds at whatever was chosen on
+    the day, and it cannot answer "how far did the median person get" at all. `$scroll` carries
+    the maximum reached with the window's height and the document's, and `scrollDepth` buckets
+    it — so the drop bands the brief wants later are a different reading of the same column
+    rather than a new capture.
+
+    Two bugs found by writing the beacon's own tests, both of the kind that would have shipped
+    looking correct:
+
+    * **The maximum was kept as a percentage.** A 700px page read in full is 100%, and when an
+      image decodes and the page becomes 5000px the maximum is still 100 although the visitor
+      has seen a seventh of it. Pixels are monotonic in the thing being measured; the
+      percentage is worked out at the end against the height the document finally had.
+    * **A single-page app filed the depth under the wrong page.** `record` stamps the current
+      location, and the report for a view is sent from inside the navigation that has already
+      changed it — so the first page's depth landed on the second page's URL, silently, and
+      made the second page look like the one people read to the end.
+
+    **Conversions were two narrow gaps, not a missing feature.** Named events already worked;
+    what did not was a form sent with the Enter key or by the page's own logic, which fires no
+    click and so produced no event at all — on a small business site, the contact form is the
+    conversion. `form_submit` carries the form's own label and nothing else; the handler never
+    reads `elements`, because a submit handler is the easiest place in an analytics script to
+    collect an email address by accident. The other gap was a denominator: every widget
+    returned counts, so a rate meant two queries and a division in the page, which is how two
+    tiles end up disagreeing about how many visitors there were. The event widgets now carry
+    an `audience`.
+
+    **Click friction is two hypotheses, never a finding.** Rage runs needed no new capture at
+    all — session, millisecond order and position were already stored — and dead clicks needed
+    one bit: whether the click landed on something that does anything. One bit and not an
+    element descriptor, because a boolean cannot carry somebody's own data into an event; the
+    richer version wants a stable component identity on every rendered element, which is a
+    separate platform decision with a page-weight cost.
+
+    Two things the tests forced:
+
+    * **A page recorded before the column reads as entirely dead**, since absent and zero are
+      the same byte. The answer carries `measured` and the dead list is empty when nothing was
+      ever marked live — the difference between "nothing is broken" and "nothing was measured",
+      which is the most alarming possible way to be wrong.
+    * **A button straddling a cell boundary was two half-strength spots**, and which one ranked
+      first came down to where the button sat. Touching cells are merged into one place, and
+      the merged spot takes the position of its busiest cell rather than an average of two.
+
+    And the audit's own findings, which are in section 12: a visitor is a visitor-day and
+    nothing said so, the salt was redrawn at every restart, the funnel's default window was a
+    week when identity lasts a day, and two cross-period tiles were live on both dashboards
+    reporting confidently about something this engine cannot see.
+
+15. **Paths** — sequence to edge counts, with step and branching caps.
+16. **Correlation** — contingency tables, chi-squared with a Fisher fallback, Benjamini-Hochberg.
     Last of the analyses because it depends on the funnel and is the one that can be
     confidently wrong.
-15. **Error tracking** — fingerprinting and its rollup, reusing everything above.
-16. **Second node** — hash in the Worker, proven with no engine change.
+17. **Error tracking** — fingerprinting and its rollup, reusing everything above.
+18. **Second node** — hash in the Worker, proven with no engine change.
 
 Milestones 1-5 are the product. 6 is what makes the rest trustworthy. Nothing before 11
 changes anything a user sees, so the PostHog stacks keep running untouched until then.
@@ -1017,6 +1095,29 @@ changes anything a user sees, so the PostHog stacks keep running untouched until
 - **HLL approximation is user-visible.** ~0.8% error on a unique-visitor count shown to a
   paying customer. Exact counts mean a raw scan and a different cost model — decide before
   the UI promises a number.
+- **A visitor is a visitor-DAY, and this was never written down.** The salt rotates at UTC
+  midnight, so somebody who comes on two days is two visitors. Three consequences, none of
+  them visible in a dashboard, all found while auditing this engine against the SiteZump
+  analytics brief rather than by any test:
+
+  1. A unique-visitor count over a range is the SUM of that range's daily uniques. It exceeds
+     the number of people by however often they came back, and the sketch error — the thing
+     we had been careful to label — is an order of magnitude smaller than this.
+  2. `retention`, `stickiness` and `lifecycle` cannot be answered at all. Every visitor is new
+     every day; stickiness reports one period for everybody. Two of them were live on the
+     SiteZump and AppBuilder dashboards, reporting confidently.
+  3. A funnel window that crosses midnight loses conversions rather than finding slow ones,
+     and the DEFAULT window was a week.
+
+  Now: `visitorsDaily` on every answer that crosses a rotation, `windowHours` capped at 24 and
+  refused rather than clamped, and the three cross-period tiles taken off both dashboards. The
+  widgets stay implemented — they are correct code with unanswerable data, and they return the
+  day identity does.
+- **The salt was also redrawn at every restart**, so a deploy at noon split that day's visitors
+  in two, and two nodes never agreed at all. `ANALYTICS_VISITOR_SECRET` makes the day's salt
+  `HMAC(secret, date)`: same rotation, same unlinkability, no restart artefact. It must be the
+  same value on every node. Unset keeps the old behaviour, because a standalone node with
+  nowhere to keep a secret should not invent a stable one — the engine warns at boot.
 - **Compaction and query race.** A reader must never see a half-written Parquet file. Temp
   name plus atomic rename; on object storage rely on single-object atomicity, never on
   directory semantics.

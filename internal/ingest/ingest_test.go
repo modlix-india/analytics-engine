@@ -376,3 +376,92 @@ func TestBatchEventsGetDistinctIncreasingTimestamps(t *testing.T) {
 		t.Errorf("a 3-event batch spans %dms, want exactly 2", spread)
 	}
 }
+
+// A restart must not split a day's visitors in two.
+//
+// This is the whole reason the day's salt is derived from a secret rather than drawn fresh:
+// without it a deploy at noon makes every visitor after it a new person, the same visitor is
+// counted twice, and nothing in any dashboard says so. The rotation must still hold — a
+// secret that made ids stable ACROSS days would trade the restart bug for a durable
+// identifier, which is the thing the design refuses to have.
+func TestConfiguredSecretSurvivesRestartButStillRotates(t *testing.T) {
+	day := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+
+	// Two Ingesters with the same secret stand in for a process before and after a restart,
+	// and equally for two nodes in a fleet: the code cannot tell the difference, and neither
+	// case may invent a second visitor.
+	visitor := func(i *Ingester, sink *memSink) string {
+		r := httptest.NewRequest(http.MethodPost, "/i",
+			strings.NewReader(`{"u":"https://s.example/","b":[{"e":"$pageview"}]}`))
+		r.Header.Set("User-Agent", chromeMac)
+		r.Header.Set("CF-Connecting-IP", "203.0.113.7")
+		i.Handle(httptest.NewRecorder(), r)
+		evs := sink.events(t)
+		return evs[len(evs)-1].Visitor
+	}
+
+	build := func(secret string) (*Ingester, *memSink) {
+		sink := &memSink{}
+		return New(Options{
+			Sink:          sink,
+			Resolver:      HostResolver{},
+			Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Now:           func() time.Time { return day },
+			VisitorSecret: secret,
+		}), sink
+	}
+
+	first, firstSink := build("a-secret-that-outlives-the-process")
+	second, secondSink := build("a-secret-that-outlives-the-process")
+
+	a, b := visitor(first, firstSink), visitor(second, secondSink)
+	if a != b {
+		t.Errorf("a restart split one visitor into two: %q then %q", a, b)
+	}
+
+	day = day.Add(24 * time.Hour)
+	third, thirdSink := build("a-secret-that-outlives-the-process")
+	if c := visitor(third, thirdSink); c == a {
+		t.Errorf("the configured secret defeated the daily rotation; ids must not be linkable across days")
+	}
+
+	// A different secret is a different fleet, and must not agree.
+	day = time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	other, otherSink := build("a-different-secret")
+	if d := visitor(other, otherSink); d == a {
+		t.Errorf("two different secrets produced the same visitor id")
+	}
+}
+
+// With no secret the old behaviour stands: correct for a standalone node, and the reason the
+// warning at boot exists.
+func TestNoSecretStillDrawsAFreshSaltPerProcess(t *testing.T) {
+	day := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+
+	build := func() (*Ingester, *memSink) {
+		sink := &memSink{}
+		return New(Options{
+			Sink:     sink,
+			Resolver: HostResolver{},
+			Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Now:      func() time.Time { return day },
+		}), sink
+	}
+
+	visitor := func(i *Ingester, sink *memSink) string {
+		r := httptest.NewRequest(http.MethodPost, "/i",
+			strings.NewReader(`{"u":"https://s.example/","b":[{"e":"$pageview"}]}`))
+		r.Header.Set("User-Agent", chromeMac)
+		r.Header.Set("CF-Connecting-IP", "203.0.113.7")
+		i.Handle(httptest.NewRecorder(), r)
+		evs := sink.events(t)
+		return evs[len(evs)-1].Visitor
+	}
+
+	a, aSink := build()
+	b, bSink := build()
+
+	if visitor(a, aSink) == visitor(b, bSink) {
+		t.Error("two processes without a secret agreed on a visitor id; the salt is not random per process")
+	}
+}
