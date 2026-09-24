@@ -61,6 +61,18 @@ type Config struct {
 	MaxBatchEvents int
 	MaxBodyBytes   int64
 
+	// VisitorSecret makes the daily visitor salt survive a restart, and makes a fleet agree
+	// about who a visitor is.
+	//
+	// Without it each process draws a fresh random salt the first time it sees a day, so a
+	// deploy at noon splits that day's visitors into two populations and two nodes never
+	// agree at all. With it the day's salt is HMAC(secret, date): same daily rotation, same
+	// unlinkability once the day passes, no restart artefact.
+	//
+	// It must be secret. Anyone holding it can re-derive today's visitor ids from an IP and
+	// a user-agent, which is exactly what the rotation exists to prevent.
+	VisitorSecret string
+
 	// QuerySecret authorises reads. Empty means the query endpoint denies everything, which
 	// is the right default: an analytics endpoint that is open because nobody set a variable
 	// is a data leak that announces itself to no one.
@@ -166,6 +178,7 @@ func Load() (Config, error) {
 		MaxBatchEvents:  envInt("ANALYTICS_MAX_BATCH_EVENTS", 500),
 		MaxBodyBytes:    envInt64("ANALYTICS_MAX_BODY_BYTES", 1<<20),
 		QuerySecret:     os.Getenv("ANALYTICS_QUERY_SECRET"),
+		VisitorSecret:   os.Getenv("ANALYTICS_VISITOR_SECRET"),
 
 		// Both spellings are accepted. The platform's existing stacks already pass OCI_S3_*
 		// to their containers, so a deployment can reuse that environment rather than

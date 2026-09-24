@@ -131,3 +131,48 @@ func loadLocation(name string) (*time.Location, error) {
 
 // inHours reports whether a rollup row falls in the given bucket set.
 func inHours(r *rollup.Row, hours map[int64]bool) bool { return hours[r.Hour] }
+
+// previousSpan returns the period immediately before s, of the same length.
+//
+// "The same length" is measured in CALENDAR days whenever the range is day-aligned in the
+// reporting zone, and in elapsed time otherwise. That distinction is the whole function:
+// subtracting a duration from a week that contains a DST change lands an hour off midnight, so
+// the comparison period would begin at 23:00 and every day in the chart would be shifted
+// against the day it is being compared to — while still looking like a plausible chart.
+//
+// Deliberately the PRECEDING period, not the previous calendar one: the thirty days before
+// September, rather than August. The two differ whenever months differ in length, and the
+// preceding period is the one that answers "is this better than it was", because it is the same
+// amount of time and it ends exactly where the current period begins. A previous-calendar-month
+// comparison is a different feature and would need its own name on the request.
+func previousSpan(s span, loc *time.Location) span {
+	start := s.Start.In(loc)
+	end := s.End.In(loc)
+
+	if isMidnight(start) && isMidnight(end) {
+		days := calendarDaysBetween(start, end)
+		if days > 0 {
+			return span{start.AddDate(0, 0, -days), s.Start}
+		}
+	}
+	return span{s.Start.Add(-s.End.Sub(s.Start)), s.Start}
+}
+
+func isMidnight(t time.Time) bool {
+	return t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
+}
+
+// calendarDaysBetween counts midnight-to-midnight steps, which is not the elapsed time divided
+// by 24 hours on the two days a year that are not 24 hours long.
+func calendarDaysBetween(start, end time.Time) int {
+	n := 0
+	for t := start; t.Before(end); t = t.AddDate(0, 0, 1) {
+		n++
+		if n > 400 {
+			// The handler caps a range at 400 days; this is the belt to that braces, so a
+			// malformed span cannot spin here.
+			break
+		}
+	}
+	return n
+}

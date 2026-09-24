@@ -180,12 +180,21 @@ func run() error {
 			"path_hosts", cfg.PathHosts)
 	}
 
+	if cfg.VisitorSecret == "" {
+		// Not fatal: a standalone node with nowhere to keep a secret is a supported way to
+		// run this. But the consequence is invisible in every dashboard, so it is said once
+		// at boot rather than discovered when two days of numbers refuse to reconcile.
+		log.Warn("no ANALYTICS_VISITOR_SECRET: the visitor salt is redrawn at every restart, " +
+			"so a deploy splits that day's visitors in two and a second node never agrees with this one")
+	}
+
 	ing := ingest.New(ingest.Options{
 		Sink:           w,
 		Resolver:       resolver,
 		Log:            log,
 		MaxBatchEvents: cfg.MaxBatchEvents,
 		MaxBodyBytes:   cfg.MaxBodyBytes,
+		VisitorSecret:  cfg.VisitorSecret,
 		OnEvent: func(outcome string) {
 			m.EventsReceived.WithLabelValues(outcome).Inc()
 		},

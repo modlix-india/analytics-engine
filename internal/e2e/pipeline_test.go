@@ -110,6 +110,13 @@ type result struct {
 		Events   int64  `json:"events"`
 		Visitors int64  `json:"visitors"`
 	} `json:"rows"`
+	Denominator int64 `json:"denominator"`
+	Scroll      *struct {
+		Views      int64   `json:"views"`
+		AveragePct float64 `json:"averagePct"`
+		MedianPct  int32   `json:"medianPct"`
+		FoldPct    int32   `json:"foldPct"`
+	} `json:"scroll"`
 }
 
 func ask(t *testing.T, srv *httptest.Server, body string) result {
@@ -207,5 +214,92 @@ func TestCustomEventNamesAreStoredVerbatim(t *testing.T) {
 	}
 	if names["$pageview"] != 1 {
 		t.Errorf("$pageview = %d, want 1 (pageview must be folded onto it): %+v", names["$pageview"], names)
+	}
+}
+
+// The visit widgets read a column nothing had ever read.
+//
+// `session` has been written on every row since the first release and no widget consumed it,
+// so a whole tier of the pipeline was carrying it untested: the beacon mints it, the batch
+// sends it under `s`, ingest copies it, Parquet stores it. A unit test over hand-built rows
+// cannot catch a break anywhere in that chain, because it starts after all of it. This one
+// begins at an HTTP request, which is the only place the spelling of `s` is exercised.
+func TestSessionFromTheWireReachesTheVisitWidgets(t *testing.T) {
+	srv, dir := stack(t)
+
+	// One visit: two pages, arriving on /landing and leaving from /pricing.
+	send(t, srv, `{"u":"https://shop.example/landing","s":"sess-one","b":[{"e":"pageview"}]}`)
+	send(t, srv, `{"u":"https://shop.example/pricing","s":"sess-one","b":[{"e":"pageview"}]}`)
+	waitForParquet(t, dir)
+
+	from, to := window()
+
+	entries := ask(t, srv, fmt.Sprintf(
+		`{"widget":"entryPages","site":%q,"from":%q,"to":%q,"timezone":"UTC","limit":10}`,
+		site, from, to))
+	if len(entries.Rows) != 1 || entries.Rows[0].Label != "/landing" {
+		t.Fatalf("entryPages = %+v, want one row for /landing", entries.Rows)
+	}
+
+	exits := ask(t, srv, fmt.Sprintf(
+		`{"widget":"exitPages","site":%q,"from":%q,"to":%q,"timezone":"UTC","limit":10}`,
+		site, from, to))
+	if len(exits.Rows) != 1 || exits.Rows[0].Label != "/pricing" {
+		t.Fatalf("exitPages = %+v, want one row for /pricing", exits.Rows)
+	}
+	if exits.Denominator != 1 {
+		t.Errorf("exit denominator = %d, want 1 visit", exits.Denominator)
+	}
+
+	pages := ask(t, srv, fmt.Sprintf(
+		`{"widget":"pagesPerVisit","site":%q,"from":%q,"to":%q,"timezone":"UTC","limit":10}`,
+		site, from, to))
+	if len(pages.Rows) != 1 || pages.Rows[0].Label != "2" || pages.Rows[0].Events != 1 {
+		t.Fatalf("pagesPerVisit = %+v, want one visit of 2 pages", pages.Rows)
+	}
+}
+
+// A scroll report has to survive the whole chain, and the chain is where this class of bug
+// lives: three new wire keys, three new columns appended to the packed encoding, three more in
+// Parquet, and a widget that filters on an event name. Every one of those is correct in
+// isolation in a unit test. This is the only test that has to agree with itself about the
+// spelling of `d`, `h` and `dh`.
+func TestScrollFromTheWireReachesTheWidget(t *testing.T) {
+	srv, dir := stack(t)
+
+	send(t, srv, `{"u":"https://shop.example/long","s":"sess-one","b":[
+		{"e":"pageview"},
+		{"e":"$scroll","d":60,"h":900,"dh":4000,"w":1440}
+	]}`)
+	send(t, srv, `{"u":"https://shop.example/long","s":"sess-two","b":[
+		{"e":"pageview"},
+		{"e":"$scroll","d":100,"h":900,"dh":4000,"w":1440}
+	]}`)
+	waitForParquet(t, dir)
+
+	from, to := window()
+	got := ask(t, srv, fmt.Sprintf(
+		`{"widget":"scrollDepth","site":%q,"path":"/long","from":%q,"to":%q,"timezone":"UTC"}`,
+		site, from, to))
+
+	byLabel := map[string]int64{}
+	for _, r := range got.Rows {
+		byLabel[r.Label] = r.Events
+	}
+	if byLabel["50%"] != 2 {
+		t.Errorf("50%% reached by %d, want 2: %+v", byLabel["50%"], got.Rows)
+	}
+	if byLabel["75%"] != 1 {
+		t.Errorf("75%% reached by %d, want 1 — only one view got past it: %+v", byLabel["75%"], got.Rows)
+	}
+	if got.Scroll == nil {
+		t.Fatal("no scroll summary came back through the wire")
+	}
+	if got.Scroll.Views != 2 {
+		t.Errorf("views = %d, want 2", got.Scroll.Views)
+	}
+	// 900 of 4000 visible without scrolling.
+	if got.Scroll.FoldPct != 22 {
+		t.Errorf("fold = %d, want 22 — the two heights did not survive the wire", got.Scroll.FoldPct)
 	}
 }

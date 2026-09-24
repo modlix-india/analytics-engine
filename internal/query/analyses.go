@@ -53,11 +53,29 @@ func (e *Engine) funnel(ctx context.Context, req Request, loc *time.Location) (*
 		return nil, fmt.Errorf("query: a funnel is limited to ten steps")
 	}
 
+	// A funnel cannot see past the end of a day, and the window is where that shows.
+	//
+	// The visitor id is derived from a salt that rotates at UTC midnight, so the same person is
+	// a different visitor tomorrow by construction. A window that spans a boundary therefore
+	// does not find a slow conversion, it loses it: the second half of the journey belongs to
+	// somebody who never took the first step. The default used to be a week, which meant the
+	// default answer was quietly low for every funnel that took more than a few hours.
+	//
+	// So the ceiling is a day, refused rather than clamped. Clamping would answer a different
+	// question from the one asked and say nothing about it, which is the failure this replaces.
+	const maxWindow = 24 * time.Hour
+
 	window := time.Duration(req.WindowHours) * time.Hour
 	if req.WindowHours == 0 {
-		// A week. A funnel with no window at all counts a visitor who returned six months
-		// later as a conversion, which is rarely what anyone means.
-		window = 7 * 24 * time.Hour
+		window = maxWindow
+	}
+	if window > maxWindow {
+		return nil, fmt.Errorf(
+			"query: windowHours is limited to 24; visitor identity rotates daily, so a longer " +
+				"window would report a conversion as a drop-off whenever the journey crossed midnight")
+	}
+	if window < 0 {
+		return nil, fmt.Errorf("query: windowHours must not be negative")
 	}
 
 	counts := make([]uint64, len(req.Steps))

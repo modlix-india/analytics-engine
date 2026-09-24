@@ -50,6 +50,24 @@ const (
 	WidgetStickiness = "stickiness"
 	WidgetLifecycle  = "lifecycle"
 
+	// The visit analyses. Same sort-merge, partitioned on the session rather than the
+	// visitor — which is why these four are answerable while retention, stickiness and
+	// lifecycle are not: everything they ask about happens inside one visit, and the
+	// visitor salt rotation cannot reach inside one.
+	// Where a page is frustrating, as a hypothesis rather than a finding. Same page, same
+	// grid and same bands as the heatmap, because it is drawn over it.
+	WidgetClickFriction = "clickFriction"
+
+	// How far down a page people got. Raw and per-page, like the heatmap, and bounded the
+	// same way: one page at a time, asked for by somebody looking at it.
+	WidgetScrollDepth = "scrollDepth"
+	WidgetScrollPages = "scrollPages"
+
+	WidgetEntryPages    = "entryPages"
+	WidgetExitPages     = "exitPages"
+	WidgetPagesPerVisit = "pagesPerVisit"
+	WidgetVisitLength   = "visitLength"
+
 	// Not a PostHog port. The mobile WebView stamps its identity into the user-agent, so
 	// "how many of my users are on the app, and how many are on an old version" becomes an
 	// ordinary rollup dimension rather than a guess from the OS string.
@@ -128,7 +146,31 @@ type Request struct {
 	// comparable within a band, because a band is a layout.
 	Viewport int32
 
+	// Compare asks for the same question answered over the preceding period as well.
+	//
+	// "previous" is the only value, and an unknown one is refused rather than ignored: a
+	// misspelling that silently returned no comparison would look exactly like a period with
+	// no data in it.
+	Compare string
+
 	Limit int
+}
+
+// ComparePrevious is the one comparison this engine offers.
+const ComparePrevious = "previous"
+
+// comparable lists the widgets a comparison may be asked for.
+//
+// The rollup-backed ones only. A comparison doubles the work, and doubling a rollup read is
+// two more cheap scans of pre-aggregated buckets, where doubling a funnel or a heatmap is a
+// second pass over raw Parquet — the expensive thing this engine is careful about. If those
+// are wanted later they can be added here; refusing now is honest about what it would cost.
+var comparable = map[string]bool{
+	WidgetPageviewsOverTime: true, WidgetEventTimeline: true, WidgetTopEvents: true,
+	WidgetTopPages: true, WidgetTopReferrers: true, WidgetChannelBreakdown: true,
+	WidgetDeviceBreakdown: true, WidgetBrowserBreakdown: true, WidgetOSBreakdown: true,
+	WidgetGeoBreakdown: true, WidgetPlatformBreakdown: true, WidgetAppVersions: true,
+	WidgetBreakdownByProperty: true,
 }
 
 type Row struct {
@@ -136,11 +178,49 @@ type Row struct {
 	Events   int64  `json:"events"`
 	Visitors uint64 `json:"visitors"`
 
+	// Visits is the number of sessions, and it is set only on headline rows — the totals and
+	// the time series — because only those carry a session sketch.
+	//
+	// Breakdown rows deliberately do not: a second sketch on every one of them doubled the
+	// rollup tier for a figure almost nobody reads, so "visits to /pricing" comes from the
+	// visit widgets' raw scan instead. The field is omitted rather than zeroed there, so a
+	// reader can tell "no sessions" from "not measured at this grain".
+	Visits uint64 `json:"visits,omitempty"`
+
 	// Page and Path are set only by the heatmap page list, where one label is not enough to
 	// act on: the page says which clicks to ask for, and the path says where to open it. A
 	// page routed to from an address is not the same thing as the address.
 	Page string `json:"page,omitempty"`
 	Path string `json:"path,omitempty"`
+}
+
+// Audience is how big the site was over the same range: what a rate is a share OF.
+//
+// Returned on the event widgets, because those are where somebody works out a conversion
+// rate, and a rate computed from two separate queries is a rate whose denominator nobody
+// checked. One request, one denominator, one definition of who counted.
+//
+// Unlike PeriodTotal this DOES carry visitors, and legitimately: it is the union of the
+// hourly sketches for page views over the range, not a sum across keys. The daily identity
+// rotation still applies, which is what VisitorsDaily on the same answer is saying.
+type Audience struct {
+	Visitors uint64 `json:"visitors"`
+	Visits   uint64 `json:"visits"`
+	Views    int64  `json:"views"`
+}
+
+// PeriodTotal is a whole period in one line.
+//
+// Deliberately NOT a Row, and the missing field is the point: there is no visitor count here.
+// Uniques do not add — summing them over keys counts one person once per page they read, and
+// summing them over days counts them once per day, which the daily identity rotation makes
+// unavoidable anyway. A Row would have carried a `visitors: 0` into every response, and a zero
+// in a field somebody is reading is worse than no field at all.
+type PeriodTotal struct {
+	Events int64 `json:"events"`
+
+	// Visits is the number of sessions, present only where the rows carried one.
+	Visits uint64 `json:"visits,omitempty"`
 }
 
 type Result struct {
@@ -153,6 +233,8 @@ type Result struct {
 	Stickiness []StickinessBucket `json:"stickiness,omitempty"`
 	Lifecycle  []LifecyclePoint   `json:"lifecycle,omitempty"`
 	Heatmap    *Heatmap           `json:"heatmap,omitempty"`
+	Scroll     *Scroll            `json:"scroll,omitempty"`
+	Friction   *Friction          `json:"friction,omitempty"`
 
 	// RangeRelative marks a result whose meaning depends on the queried window rather than
 	// on all of history — lifecycle, where a long-standing visitor counts as new if their
@@ -168,6 +250,55 @@ type Result struct {
 	// RawHoursScanned reports how many partial hours needed a raw scan. Zero for every
 	// whole-hour timezone; two for a half-hour one, however long the range.
 	RawHoursScanned int `json:"rawHoursScanned"`
+
+	// Total sums EVERY key in the period, including the ones the limit cut off.
+	//
+	// Set on every rollup-backed answer, whether or not a comparison was asked for, because a
+	// dashboard that adds up the top ten to produce a headline is wrong on exactly the sites
+	// with a long tail — and it is wrong in a way that gets worse as the site grows.
+	Total *PeriodTotal `json:"total,omitempty"`
+
+	// Previous holds the same rows for the preceding period, ALIGNED INDEX FOR INDEX with
+	// Rows, and is present only when the request asked to compare.
+	//
+	// Aligned rather than ranked on its own, because the two are read together: a chart draws
+	// them as two series and a table takes a difference per line. A second independently
+	// sorted top-ten would put last month's best page beside this month's third best, and the
+	// resulting delta would be arithmetic performed on two different things.
+	//
+	// A key that existed then and does not now is therefore absent from this list. That is a
+	// real loss of information, and it is the right trade for a widget whose question is "what
+	// is biggest NOW": PreviousTotal covers the case where the reader only wants to know
+	// whether the whole period moved.
+	Previous []Row `json:"previous,omitempty"`
+
+	// PreviousTotal sums the preceding period across EVERY key, not only the ones listed in
+	// Previous, so a headline delta is not quietly computed over the top ten alone.
+	PreviousTotal *PeriodTotal `json:"previousTotal,omitempty"`
+
+	// Audience is the site's own size over this range, for turning a count into a rate.
+	Audience *Audience `json:"audience,omitempty"`
+
+	// Denominator is what the rows are a share OF, where that is a definite number.
+	//
+	// Exit pages over visits is the example that motivates it: the share is the question
+	// ("what proportion of visits end here"), and a caller left to divide by a total from a
+	// second query would sometimes divide by a total that was computed over a different set of
+	// visits. One query, one denominator, one definition of which visits counted.
+	Denominator int64 `json:"denominator,omitempty"`
+
+	// VisitorsDaily says that a visitor count in this answer counts visitor-DAYS, not people.
+	//
+	// Visitor identity is derived from a salt that rotates at UTC midnight, so somebody who
+	// came on Monday and again on Tuesday is two visitors. Within one day the figure is what
+	// it looks like; across a range it is the sum of each day's uniques, and it exceeds the
+	// number of people by however often they came back.
+	//
+	// Reported rather than corrected, because it cannot be corrected here: the information
+	// needed to link the two is deliberately destroyed at ingest. A dashboard showing this
+	// figure under the word "Visitors" without saying so is the thing this flag exists to
+	// prevent, and it is the same contract as VisitorsApproximate.
+	VisitorsDaily bool `json:"visitorsDaily,omitempty"`
 }
 
 type Engine struct {
@@ -206,7 +337,9 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 	}
 	switch req.Widget {
 	case WidgetFunnel, WidgetRetention, WidgetStickiness, WidgetLifecycle,
-		WidgetHeatmap, WidgetHeatmapPages:
+		WidgetHeatmap, WidgetHeatmapPages, WidgetScrollDepth, WidgetScrollPages,
+		WidgetClickFriction,
+		WidgetEntryPages, WidgetExitPages, WidgetPagesPerVisit, WidgetVisitLength:
 		// Left empty deliberately: for these, "" means ANY event, which is the usual
 		// question. Defaulting to $pageview here would make that impossible to express.
 	default:
@@ -223,6 +356,118 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 
+	res, err := e.dispatch(ctx, req, loc)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.Compare != "" {
+		if err := e.attachComparison(ctx, req, loc, res); err != nil {
+			return nil, err
+		}
+	}
+
+	// Only the event widgets. Everything else already answers in the unit its reader is
+	// thinking in — a breakdown of pages against each other needs no site-wide base, and
+	// fetching one would be a second rollup read on every tile of the dashboard.
+	if req.Widget == WidgetTopEvents || req.Widget == WidgetEventTimeline {
+		aud, err := e.audience(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		res.Audience = aud
+	}
+
+	// Set once, here, rather than in each widget. It depends only on the range and on a
+	// property of ingest, so deriving it per widget would be nine places to forget it.
+	res.VisitorsDaily = spansSaltRotation(req.From, req.To)
+	return res, nil
+}
+
+// attachComparison answers the same question over the preceding period and aligns it.
+func (e *Engine) attachComparison(ctx context.Context, req Request, loc *time.Location, res *Result) error {
+	if req.Compare != ComparePrevious {
+		return fmt.Errorf("query: compare must be %q, not %q", ComparePrevious, req.Compare)
+	}
+	if !comparable[req.Widget] {
+		return fmt.Errorf("query: %s cannot be compared against the previous period; "+
+			"it reads raw events rather than rollups, and a second pass would cost as much as the first",
+			req.Widget)
+	}
+
+	prevReq := req
+	prev := previousSpan(span{req.From, req.To}, loc)
+	prevReq.From, prevReq.To = prev.Start, prev.End
+	// Every key, not the top N: PreviousTotal has to cover the whole period or a headline
+	// delta computed from it is a delta of two different things.
+	prevReq.Limit = 1 << 30
+
+	prevRes, err := e.dispatch(ctx, prevReq, loc)
+	if err != nil {
+		return err
+	}
+
+	// Taken from the previous answer's own total, which was computed over every key before
+	// its limit was applied — the same rule as Total, so the two are comparable by
+	// construction rather than by coincidence.
+	res.PreviousTotal = prevRes.Total
+
+	// A time series is aligned by POSITION — the first day of one period against the first of
+	// the other — and everything else by LABEL. Using labels for a time series would align
+	// nothing at all, since the two periods share no dates by construction.
+	if req.Widget == WidgetPageviewsOverTime || req.Widget == WidgetEventTimeline {
+		res.Previous = alignByPosition(prevRes.Rows, len(res.Rows))
+		return nil
+	}
+	res.Previous = alignByLabel(prevRes.Rows, res.Rows)
+	return nil
+}
+
+// alignByPosition pads or truncates to n rows, so a caller can index both series together
+// without checking a length it did not choose.
+func alignByPosition(prev []Row, n int) []Row {
+	out := make([]Row, n)
+	for i := range out {
+		if i < len(prev) {
+			out[i] = prev[i]
+		}
+		// The label is the CURRENT period's business; leaving the previous period's date here
+		// would put two different dates on one column of a chart.
+		out[i].Label = ""
+	}
+	return out
+}
+
+// alignByLabel emits one row per current row, zero where the key did not exist before. A zero
+// is the true answer for a page that is new this period, and it is what makes the delta read
+// as "all of it is new" rather than as a missing row.
+func alignByLabel(prev, current []Row) []Row {
+	byKey := make(map[string]Row, len(prev))
+	for _, r := range prev {
+		byKey[r.Label] = r
+	}
+
+	out := make([]Row, len(current))
+	for i, r := range current {
+		p := byKey[r.Label]
+		p.Label = r.Label
+		out[i] = p
+	}
+	return out
+}
+
+// spansSaltRotation reports whether a range crosses a UTC midnight, which is where the visitor
+// salt rotates and therefore where one person becomes two.
+//
+// UTC, not the reporting zone: the rotation happens on the engine's clock regardless of which
+// day boundary the reader is asking about. A single IST day spans a UTC midnight and is
+// therefore affected, which is exactly the sort of thing a reporting-zone comparison would
+// have hidden.
+func spansSaltRotation(from, to time.Time) bool {
+	return !from.UTC().Truncate(24 * time.Hour).Equal(to.UTC().Add(-time.Nanosecond).Truncate(24 * time.Hour))
+}
+
+func (e *Engine) dispatch(ctx context.Context, req Request, loc *time.Location) (*Result, error) {
 	// Both time series are the same code path; they differ only in which event they default
 	// to, so keeping two names is about the caller's vocabulary, not about behaviour.
 	if req.Widget == WidgetPageviewsOverTime || req.Widget == WidgetEventTimeline {
@@ -247,6 +492,20 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 		return res, err
 	case WidgetTopEvents:
 		return e.topEvents(ctx, req)
+	case WidgetClickFriction:
+		return e.clickFriction(ctx, req)
+	case WidgetScrollDepth:
+		return e.scrollDepth(ctx, req)
+	case WidgetScrollPages:
+		return e.scrollPages(ctx, req)
+	case WidgetEntryPages:
+		return e.entryPages(ctx, req)
+	case WidgetExitPages:
+		return e.exitPages(ctx, req)
+	case WidgetPagesPerVisit:
+		return e.pagesPerVisit(ctx, req)
+	case WidgetVisitLength:
+		return e.visitLength(ctx, req)
 	case WidgetHeatmap:
 		return e.heatmap(ctx, req)
 	case WidgetHeatmapPages:
@@ -259,6 +518,26 @@ func (e *Engine) Query(ctx context.Context, req Request) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("query: unknown widget %q", req.Widget)
 	}
+}
+
+// audience counts the page views, visitors and visits of the whole site over the range.
+//
+// From the DimNone rows for $pageview, which is where the headline sketches live: a union of
+// hourly sketches over the range rather than a sum over keys, so it is a real unique count
+// within the limit the daily salt rotation sets.
+func (e *Engine) audience(ctx context.Context, req Request) (*Audience, error) {
+	merged, _, err := e.aggregate(ctx, req.Site, event.NamePageview, rollup.DimNone, span{req.From, req.To})
+	if err != nil {
+		return nil, err
+	}
+
+	var a Audience
+	for _, m := range merged {
+		a.Views += m.Events
+		a.Visitors += m.Visitors
+		a.Visits += m.Sessions
+	}
+	return &a, nil
 }
 
 // topEvents ranks event names rather than the values of one dimension.
@@ -283,12 +562,15 @@ func (e *Engine) topEvents(ctx context.Context, req Request) (*Result, error) {
 	res := &Result{
 		Widget: req.Widget, Site: req.Site,
 		VisitorsApproximate: true, RawHoursScanned: rawHours,
+		Total: totalOf(merged),
 	}
 	for i, m := range merged {
 		if i >= req.Limit {
 			break
 		}
-		res.Rows = append(res.Rows, Row{Label: m.Key, Events: m.Events, Visitors: m.Visitors})
+		res.Rows = append(res.Rows, Row{
+			Label: m.Key, Events: m.Events, Visitors: m.Visitors, Visits: m.Sessions,
+		})
 	}
 	return res, nil
 }
@@ -312,9 +594,20 @@ func (e *Engine) overTime(ctx context.Context, req Request, loc *time.Location) 
 		for _, m := range merged {
 			row.Events += m.Events
 			row.Visitors += m.Visitors
+			row.Visits += m.Sessions
 		}
 		res.Rows = append(res.Rows, row)
 	}
+
+	// Every day is listed, so summing the rows IS every key. Visitors are deliberately left
+	// out for the reason totalOf gives: a visitor active on three days would count three
+	// times, and the union those sketches would give is a different question from this one.
+	total := &PeriodTotal{}
+	for _, r := range res.Rows {
+		total.Events += r.Events
+		total.Visits += r.Visits
+	}
+	res.Total = total
 	return res, nil
 }
 
@@ -328,6 +621,7 @@ func (e *Engine) breakdown(ctx context.Context, req Request, dim string) (*Resul
 	res := &Result{
 		Widget: req.Widget, Site: req.Site,
 		VisitorsApproximate: true, RawHoursScanned: rawHours,
+		Total: totalOf(merged),
 	}
 	for i, m := range merged {
 		if i >= req.Limit {
@@ -336,6 +630,20 @@ func (e *Engine) breakdown(ctx context.Context, req Request, dim string) (*Resul
 		res.Rows = append(res.Rows, Row{Label: m.Key, Events: m.Events, Visitors: m.Visitors})
 	}
 	return res, nil
+}
+
+// totalOf sums every key, which is what a headline number is.
+//
+// Visitors are NOT summed across keys — that would count one person once per page they read.
+// A unique count over a set of sketches is the union of those sketches, and the union is
+// already available as the DimNone row, so the honest thing here is to leave it out rather
+// than to add up something that does not add. Events do add.
+func totalOf(merged []rollup.Merged) *PeriodTotal {
+	t := &PeriodTotal{}
+	for _, m := range merged {
+		t.Events += m.Events
+	}
+	return t
 }
 
 // aggregate is where the two tiers meet: whole hours from rollups, boundary remainders from
