@@ -304,3 +304,31 @@ func TestDefaultTimezoneAppliesWhenTheRequestNamesNone(t *testing.T) {
 		t.Errorf("an explicit zone put the event on %q; want 2026-09-20, so the request must override the default", day)
 	}
 }
+
+// The daily-visitor flag has to key on the UTC rotation, not on the reporting day, and it has
+// to be exclusive at the upper end: a request for exactly one UTC day is not two days.
+func TestVisitorsDailyFlagsARangeThatCrossesTheSaltRotation(t *testing.T) {
+	utc := func(y int, m time.Month, d, h int) time.Time {
+		return time.Date(y, m, d, h, 0, 0, 0, time.UTC)
+	}
+
+	cases := []struct {
+		name     string
+		from, to time.Time
+		want     bool
+	}{
+		{"one whole UTC day", utc(2026, 9, 19, 0), utc(2026, 9, 20, 0), false},
+		{"part of one day", utc(2026, 9, 19, 6), utc(2026, 9, 19, 18), false},
+		{"one hour past midnight", utc(2026, 9, 19, 23), utc(2026, 9, 20, 1), true},
+		{"a week", utc(2026, 9, 13, 0), utc(2026, 9, 20, 0), true},
+		// An IST day runs 18:30 UTC to 18:30 UTC, so a single local day crosses a rotation.
+		// This is the case a reporting-zone comparison would have called safe.
+		{"one IST day", utc(2026, 9, 18, 18).Add(30 * time.Minute), utc(2026, 9, 19, 18).Add(30 * time.Minute), true},
+	}
+
+	for _, c := range cases {
+		if got := spansSaltRotation(c.from, c.to); got != c.want {
+			t.Errorf("%s: spansSaltRotation = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

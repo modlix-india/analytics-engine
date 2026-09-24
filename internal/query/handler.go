@@ -56,6 +56,9 @@ type request struct {
 	WindowHours int      `json:"windowHours"`
 	Period      string   `json:"period"`
 
+	// Compare asks for the preceding period alongside this one. "previous" or absent.
+	Compare string `json:"compare"`
+
 	// Heatmap only: the page, the experiment arm, and the width band to draw.
 	Path     string `json:"path"`
 	Page     string `json:"page"`
@@ -122,7 +125,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Event: req.Event, Property: req.Property,
 		Steps: req.Steps, WindowHours: req.WindowHours, Period: req.Period,
 		Path: req.Path, Page: req.Page, Variant: req.Variant, Viewport: req.Viewport,
-		Limit: req.Limit,
+		Compare: req.Compare,
+		Limit:   req.Limit,
 	})
 	if err != nil {
 		// The engine's errors are about the request — an unknown widget, an unknown

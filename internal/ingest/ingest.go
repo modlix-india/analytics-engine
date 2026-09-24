@@ -7,6 +7,7 @@ package ingest
 
 import (
 	"compress/gzip"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -102,7 +103,26 @@ type wireEvent struct {
 	X int32 `json:"x"`
 	Y int32 `json:"y"`
 	W int32 `json:"w"`
+
+	// How far down the page a view got: D percent of the document's height, H the window's
+	// height and DH the document's, both in css pixels. Only a $scroll report carries them,
+	// and it carries W as well so a depth can be banded by layout the way a click is.
+	D  int32 `json:"d"`
+	H  int32 `json:"h"`
+	DH int32 `json:"dh"`
+
+	// 1 when a click landed on something interactive, 0 when it did not. One bit, and
+	// deliberately one bit: a boolean cannot carry a person's own data into an event.
+	I int32 `json:"i"`
 }
+
+// NameScroll is one view's maximum scroll depth, reported when the view ends.
+//
+// Separate from pageleave, which a site can switch off independently, and separate from the
+// page view itself, which is counted whether or not anyone scrolled. One report per view
+// rather than an event per threshold crossed: five times fewer events, and the thresholds stay
+// a reading decision rather than being fixed at whatever was chosen on the day.
+const NameScroll = "$scroll"
 
 type Options struct {
 	Sink     Sink
@@ -111,6 +131,12 @@ type Options struct {
 
 	MaxBatchEvents int
 	MaxBodyBytes   int64
+
+	// VisitorSecret makes the daily visitor salt survive a restart. See rotatingSalt.
+	//
+	// Empty keeps the old behaviour — a fresh random salt per process — which is correct for
+	// a standalone deployment that has nowhere to keep a secret, and wrong for a fleet.
+	VisitorSecret string
 
 	// OnEvent reports the outcome of every event, for metrics. An engine that silently
 	// discards is indistinguishable from one that is working, so this is not optional
@@ -141,7 +167,7 @@ func New(o Options) *Ingester {
 	if o.MaxBodyBytes <= 0 {
 		o.MaxBodyBytes = 1 << 20
 	}
-	return &Ingester{opt: o, log: o.Log, now: o.Now, salt: newRotatingSalt(o.Now)}
+	return &Ingester{opt: o, log: o.Log, now: o.Now, salt: newRotatingSalt(o.Now, o.VisitorSecret)}
 }
 
 // Handle serves POST /i.
@@ -312,7 +338,17 @@ func (i *Ingester) process(r *http.Request, req *batchRequest) {
 			ClickX:   clampCoord(we.X, 10000),
 			ClickY:   clampCoord(we.Y, 200000),
 			Viewport: clampCoord(we.W, 20000),
-			Props:    string(we.Props),
+
+			// Same treatment as the click coordinates, and for the same reason: these arrive
+			// on a public endpoint and end up on an axis. A depth of 4000% is either a bug or
+			// somebody testing what this accepts, and either way it must not reach a chart.
+			Interactive: clampCoord(we.I, 1),
+
+			ScrollPct: clampCoord(we.D, 100),
+			ViewportH: clampCoord(we.H, 20000),
+			DocH:      clampCoord(we.DH, 2000000),
+
+			Props: string(we.Props),
 		}
 
 		seq++
@@ -338,20 +374,38 @@ func (i *Ingester) count(outcome string, n int) {
 
 // rotatingSalt derives a stable-for-today, unrecoverable-tomorrow visitor identifier.
 //
-// The salt is random at startup and rotates daily, and is never written to disk. That is the
-// whole privacy property: within a day the same visitor hashes to the same id so sessions and
-// uniques work, and once the salt rotates the old ids cannot be linked to anyone — not by us,
-// not by anyone who later obtains the data.
+// The salt rotates daily and is never written to disk. That is the whole privacy property:
+// within a day the same visitor hashes to the same id so sessions and uniques work, and once
+// the salt rotates the old ids cannot be linked to anyone — not by us, not by anyone who later
+// obtains the data.
+//
+// # Why the day's salt is derived rather than drawn fresh
+//
+// It used to be 32 random bytes generated the first time a day was seen, which meant the salt
+// changed on every restart as well as at midnight. A deploy at noon therefore split that day's
+// visitors into two populations: the same person counted twice, a funnel broken across the
+// restart, and nothing anywhere saying so. Deriving the day's salt as HMAC(secret, date) keeps
+// the rotation and removes the restart artefact, at the cost of one secret that has to outlive
+// the process.
+//
+// With no secret configured it falls back to the old behaviour, which is right for a
+// standalone deployment: a node with nowhere to keep a secret should not invent a stable one,
+// and restart splitting is a smaller problem than a predictable salt would be.
+//
+// A fleet must share the secret. Two nodes with different secrets hash the same visitor
+// differently, so a site served by both counts everyone twice — the restart problem again,
+// permanently.
 type rotatingSalt struct {
-	now func() time.Time
+	now    func() time.Time
+	secret []byte
 
 	mu      sync.Mutex
 	day     string
 	current []byte
 }
 
-func newRotatingSalt(now func() time.Time) *rotatingSalt {
-	return &rotatingSalt{now: now}
+func newRotatingSalt(now func() time.Time, secret string) *rotatingSalt {
+	return &rotatingSalt{now: now, secret: []byte(secret)}
 }
 
 func (s *rotatingSalt) visitorID(ip, ua, site string) string {
@@ -372,19 +426,31 @@ func (s *rotatingSalt) visitorID(ip, ua, site string) string {
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil)[:16])
 }
 
+// derive produces the salt for one day: from the configured secret where there is one, and
+// from crypto/rand where there is not.
+func (s *rotatingSalt) derive(day string) []byte {
+	if len(s.secret) > 0 {
+		h := hmac.New(sha256.New, s.secret)
+		h.Write([]byte(day))
+		return h.Sum(nil)
+	}
+
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand failing is not survivable for this purpose: a predictable salt would
+		// make every visitor id reversible by anyone who guessed it.
+		panic("ingest: crypto/rand unavailable: " + err.Error())
+	}
+	return buf
+}
+
 func (s *rotatingSalt) today() []byte {
 	day := s.now().UTC().Format("2006-01-02")
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.day != day || s.current == nil {
-		buf := make([]byte, 32)
-		if _, err := rand.Read(buf); err != nil {
-			// crypto/rand failing is not survivable for this purpose: a predictable salt
-			// would make every visitor id reversible by anyone who guessed it.
-			panic("ingest: crypto/rand unavailable: " + err.Error())
-		}
-		s.day, s.current = day, buf
+		s.day, s.current = day, s.derive(day)
 	}
 	return s.current
 }
