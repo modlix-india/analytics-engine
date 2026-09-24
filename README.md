@@ -35,6 +35,7 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 | `ANALYTICS_MAX_BODY_BYTES` | `1MiB` | bound on one ingest request |
 | `ANALYTICS_LOG_LEVEL` | `info` | |
 | `ANALYTICS_QUERY_SECRET` | — | reads are denied entirely without it |
+| `ANALYTICS_VISITOR_SECRET` | — | makes the daily visitor salt survive a restart; **share it across the fleet** |
 | `ANALYTICS_S3_BUCKET` | — | set to enable object storage; everything stays local otherwise |
 | `ANALYTICS_S3_ENDPOINT` | — | `http://` prefix selects plaintext; anything else uses TLS |
 | `ANALYTICS_S3_ACCESS_KEY` / `_SECRET_KEY` / `_REGION` / `_PREFIX` | — | `OCI_S3_*` is accepted for the first three |
@@ -81,11 +82,28 @@ mlx('experiment', 'pricing', 'b')
 mlx('consent', true)              // false revokes and stops everything
 ```
 
+When a view ends it reports **how far down the page** it got, as a separate `$scroll` event
+carrying the maximum depth reached, the window's height and the document's. One report per
+view rather than an event per threshold crossed: five times fewer events, and the thresholds
+stay a reading decision — `scrollDepth` buckets the raw number at query time, so changing the
+list changes what yesterday's data says. The depth is the bottom of the window as a share of
+the document's final height, so a page that fits on one screen was seen in full without
+anyone scrolling it, and a page that grows after it loads is measured against what it became.
+Switched off with `data-scroll="false"`.
+
 With `data-heatmaps="true"` it also records **where** each click landed, as a separate
 `$click` event carrying a position and nothing about what was hit. That is deliberately not
 the same event as autocapture's labelled `click`: switching heatmaps on must not change what
 the funnel or the event list say. It is off by default, because every click on the page
 becomes an event where autocapture records only the labelled ones.
+
+Each click also carries one bit saying whether it landed on something that **does** anything —
+a link, a button, a field, anything with a role or a handler. `clickFriction` reads it, along
+with runs of three or more clicks in one place within a second, and answers with spots rather
+than with verdicts: a run is as consistent with somebody enjoying a slider as with somebody
+jabbing at a dead button, so both lists are possibilities and the number of VISITS leads, not
+the number of clicks. A page whose clicks predate the column reports `measured: false` rather
+than reporting every click as dead, which would be the most alarming possible way to be wrong.
 
 A position is stored as a PROPORTION of the viewport width (in ten-thousandths) plus an
 absolute y in document pixels, and the width itself travels with it. A pixel abscissa means
@@ -93,7 +111,17 @@ the middle of a phone and the left gutter of a desktop, so a map that averages t
 picture of nowhere — the reader bands by width instead, and the engine keeps them apart.
 
 It sends a session id and no visitor id: the engine derives the visitor from a daily-rotating
-salt, so there is no durable identifier in the page. Page views follow SPA navigation.
+salt, so there is no durable identifier in the page. **A visitor is therefore a visitor-day.**
+Somebody who comes on Monday and again on Tuesday is two visitors, and every answer covering
+more than one UTC day carries `visitorsDaily: true` to say so. Set `ANALYTICS_VISITOR_SECRET`,
+identically on every node, or the salt is also redrawn at each restart and a deploy at noon
+splits that day in two as well. Page views follow SPA navigation.
+A submitted form is `form_submit`, carrying the form's own label — `data-analytics-label`,
+then `name`, then `id` — and **nothing else**. It closes the gap autocapture left: a form sent
+with the Enter key, or by the page's own logic after validation, fires no click and produced
+no event at all, which on a small business site is the one thing that mattered most. No field
+value is read, and the handler never touches `elements`.
+
 Autocapture is **only** elements carrying `data-analytics-label` — deliberately narrower than
 capturing every click and naming it from the DOM, because those names change with the markup
 and the text of a clicked element can carry someone's own data into an event name.
@@ -108,6 +136,8 @@ curl -X POST http://localhost:8080/i -H 'Origin: https://shop.example' \
 `u` page URL, `r` referrer, `v`/`s` visitor and session if the client tracks them, `x`/`n`
 experiment and variant, `b` the batch. Per event: `e` name, `t` client timestamp, `l` label,
 `g` page identity, `u` a URL that overrides the batch's for a SPA that navigated, `p` props.
+A `$click` adds `x`/`y`/`w` (position and window width); a `$scroll` adds `d`/`h`/`dh` (depth
+percent, window height, document height) and `w`.
 The site comes from `Origin` or `Referer` — there is no site key. Keys are short because the
 beacon's size is paid by the visitor on every page view, and this is a public contract: fields
 may be added, none may be renamed or repurposed.
@@ -150,10 +180,17 @@ curl -X POST http://localhost:8080/q -H 'Authorization: Bearer $ANALYTICS_QUERY_
 | `appVersionBreakdown` | app version |
 | `topEvents` | event name |
 | `breakdownByProperty` | the dimension named in `property` |
-| `funnel` | ordered `steps`, within `windowHours` of the first |
+| `funnel` | ordered `steps`, within `windowHours` of the first (max 24) |
 | `retention` | cohorts by first-seen `period` (day/week) |
 | `stickiness` | how many distinct periods each visitor was active |
 | `lifecycle` | new / returning / resurrecting / dormant per period |
+| `entryPages` | the pages visits begin on |
+| `exitPages` | the pages visits end on, with `denominator` = completed visits |
+| `pagesPerVisit` | how many pages one visit saw, as a distribution |
+| `visitLength` | how long one visit lasted, as a distribution |
+| `clickFriction` | possible dead clicks and repeated clicking on ONE page, as spots on the heatmap's own grid |
+| `scrollDepth` | how far down ONE page people got — takes `path` or `page`, optionally `variant` and `viewport` |
+| `scrollPages` | the pages that have scroll reports at all, ranked |
 | `heatmapPages` | the pages that have clicks at all, ranked |
 | `heatmap` | where clicks landed on ONE page, as a grid — takes `path`, and optionally `variant` and `viewport` |
 
@@ -174,13 +211,51 @@ There is no free-form query language, and that is the read security model: with 
 client-supplied expression there is nothing to sanitise, and no request can widen its scope
 beyond the site the caller was authorised for.
 
+## Comparing against the period before
+
+`"compare": "previous"` answers the same question twice and returns the second answer as
+`previous`, aligned row for row with `rows`, plus `previousTotal` against `total`.
+
+"The preceding period" is the same number of CALENDAR days ending where the current period
+begins — the thirty days before September, not August. Counted in days rather than hours
+because a week containing a DST change is 169 hours long, and subtracting a duration from it
+would start the comparison an hour off midnight and shift every column of the chart against
+the day it is being compared to, while still drawing a plausible chart.
+
+A time series aligns by POSITION, first day against first day, because the two periods share
+no dates and aligning by label would align nothing. Everything else aligns by LABEL, with a
+zero where a key is new this period. A key that existed only in the previous period is
+therefore not listed — the widget's question is what is biggest now — but it is still counted
+in `previousTotal`, which is summed over every key before any limit is applied. `total` follows
+the same rule for the current period, and is returned whether or not a comparison was asked
+for: adding up a top ten to make a headline is wrong on exactly the sites with a long tail.
+
+Only the rollup-backed widgets accept it. A comparison doubles the work, and doubling a rollup
+read is two more scans of pre-aggregated buckets where doubling a funnel or a heatmap is a
+second pass over raw Parquet. Asking for one elsewhere is an error rather than a silent
+omission, as is any value other than `previous`.
+
 **`timezone` changes no stored data** — only which hourly buckets are summed. Rollups are
 hourly rather than daily precisely so that any zone's day can be answered exactly. For
 whole-hour offsets that is pure summation; for half-hour offsets like `Asia/Kolkata` the two
 boundary hours are recomputed from raw data, which the response reports as `rawHoursScanned`.
 
-The last four read raw data rather than rollups, because they depend on the ORDER and SPACING
-of one visitor's events, which a rollup has discarded. Their counts are **exact**, and
+The four visit widgets read raw data too, partitioned on the session rather than the visitor.
+They are the analyses the daily salt rotation does NOT cost, because a visit is minutes long:
+where people arrive, where they leave, how much they saw and how long they stayed are all
+answerable while retention and lifecycle are not.
+
+Their range edges are handled rather than ignored. The scan is widened by 30 minutes at each
+end — the beacon's idle timeout, so a session id provably cannot span a longer gap — and those
+extra events only classify: a visit that began before the range is not an arrival, and one
+still running at the end has not left anywhere. Without that, whatever page people happened to
+be reading at midnight would be reported as the site's biggest leak, every day, convincingly.
+
+`exitPages`, `pagesPerVisit` and `visitLength` count only visits that both began and ended
+inside the range; `entryPages` counts every visit that began in it, finished or not.
+
+The funnel and the cohort analyses read raw data rather than rollups, because they depend on
+the ORDER and SPACING of one visitor's events, which a rollup has discarded. Their counts are **exact**, and
 `visitorsApproximate` is false for them. They are also the expensive ones: the scan is
 hash-partitioned over visitors, so memory stays bounded at the cost of re-reading a narrow
 three-column projection once per partition.
@@ -190,9 +265,27 @@ window**: a visitor of ten years' standing counts as `new` if their first event 
 range falls in its first period. Reading further back would mean scanning unbounded history to
 answer a bounded question.
 
+`topEvents` and `eventTimeline` also return an `audience`: the site's page views, visitors and
+visits over the same range. That is what a conversion rate is a share of, and returning it with
+the numerator is what stops two tiles disagreeing about the denominator because one of them
+asked a slightly different question to get it.
+
 **`visitorsApproximate` is true** wherever a visitor count comes from a rollup. Those come from
 HyperLogLog sketches: ~0.8% error on headline numbers, ~2.3% on per-key breakdowns. Event
 counts are exact.
+
+**`visitorsDaily` is true** whenever the range crosses a UTC midnight, which is where the
+visitor salt rotates. The count is then visitor-days rather than people, and it exceeds the
+number of people by however often they came back. It cannot be corrected here — what would
+link the two is destroyed at ingest on purpose — so it is reported instead, and a caller
+showing the figure under the word "Visitors" has to say which one it means. For the same
+reason `windowHours` on a funnel is capped at 24: a longer window cannot find a slower
+conversion, it reports it as a drop-off, so it is refused rather than answered.
+
+`retention`, `stickiness` and `lifecycle` are all cross-period and therefore cannot be
+answered at all while identity rotates daily: every visitor is new every day, and stickiness
+reports one period for everybody. They remain implemented and tested, and they are not on any
+dashboard.
 
 ## Durability
 

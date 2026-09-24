@@ -27,7 +27,7 @@ const SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'analy
  * of what is being tested here is what happens to an event while it is still in the queue —
  * so a test has to be able to hold the flush open and then let it go, rather than sleep.
  */
-function load({ path = '/', search = '', attrs = {}, framed = false, docHeight = 4626 } = {}) {
+function load({ path = '/', search = '', attrs = {}, framed = false, docHeight = 4626, viewHeight = 900 } = {}) {
 	const sent = [];
 	const timers = [];
 	const listeners = {};
@@ -57,8 +57,15 @@ function load({ path = '/', search = '', attrs = {}, framed = false, docHeight =
 		document: {
 			currentScript: script,
 			referrer: '',
-			addEventListener: () => {},
-			documentElement: { clientWidth: 1440, scrollHeight: docHeight },
+			// Document-level listeners, so a test can dispatch a submit the way a form does.
+			_docListeners: {},
+			addEventListener: (name, fn) => {
+				sandbox.document._docListeners[name] = fn;
+			},
+			documentElement: {
+				clientWidth: 1440, clientHeight: viewHeight,
+				scrollHeight: docHeight, offsetHeight: docHeight, scrollTop: 0,
+			},
 			body: { scrollHeight: docHeight },
 			getElementsByTagName: () => [script],
 		},
@@ -70,6 +77,12 @@ function load({ path = '/', search = '', attrs = {}, framed = false, docHeight =
 			setItem: () => {},
 		},
 		crypto: { getRandomValues: b => b.fill(7) },
+		innerWidth: 1440,
+		innerHeight: viewHeight,
+		pageYOffset: 0,
+		// Runs the callback at once. The beacon coalesces scroll measurements onto a frame,
+		// and a test that had to wait for one would be testing the scheduler.
+		requestAnimationFrame: fn => fn(),
 		fetch: (_url, opts) => {
 			sent.push(JSON.parse(opts.body));
 			return { catch: () => {} };
@@ -96,6 +109,31 @@ function load({ path = '/', search = '', attrs = {}, framed = false, docHeight =
 
 	return {
 		mlx: (...args) => sandbox.window.mlx(...args),
+		/** Scroll the window, the way a person does. */
+		scrollTo(y) {
+			sandbox.pageYOffset = y;
+			sandbox.document.documentElement.scrollTop = y;
+			if (listeners.scroll) listeners.scroll();
+		},
+		/** The page grows: an image decodes, a consent bar is answered. */
+		setDocHeight(h) {
+			sandbox.document.documentElement.scrollHeight = h;
+			sandbox.document.documentElement.offsetHeight = h;
+			sandbox.document.body.scrollHeight = h;
+		},
+		/** Submit a form, the way pressing Enter in it does. */
+		submit(attrs) {
+			const fn = sandbox.document._docListeners.submit;
+			if (!fn) throw new Error('nothing is listening for submit');
+			fn({ target: { getAttribute: n => (n in attrs ? attrs[n] : null) } });
+		},
+		/** Leave the document, which is what ends the last view. */
+		leave() {
+			if (listeners.pagehide) listeners.pagehide();
+		},
+		scrolls() {
+			return sent.flatMap(b => b.b).filter(e => e.e === '$scroll');
+		},
 		/** Let every pending timer run, which is what makes a batch go out. */
 		flush() {
 			while (timers.length) timers.shift()();
@@ -250,4 +288,165 @@ test('it reports the height once, not on every nudge', () => {
 	const page = load({ framed: true, docHeight: 4626 });
 	page.flush();
 	assert.equal(page.posted.length, 1, 'an unchanged height is not news');
+});
+
+
+/* ---- how far down the page people got ---------------------------------------------- */
+
+test('a page that fits on one screen is fully seen without anyone scrolling', () => {
+	// The most common page on a small site, and the one a threshold-event implementation
+	// reports as 0% — which is the number somebody would then redesign the page on.
+	const p = load({ docHeight: 700, viewHeight: 900 });
+	p.leave();
+	p.flush();
+
+	const [s] = p.scrolls();
+	assert.equal(s.d, 100);
+});
+
+test('it reports the deepest point reached, not the last one', () => {
+	const p = load({ docHeight: 4000, viewHeight: 1000 });
+
+	p.scrollTo(3000);  // bottom of the window at 4000 of 4000 => 100%
+	p.scrollTo(0);     // back to the top
+	p.leave();
+	p.flush();
+
+	const [s] = p.scrolls();
+	assert.equal(s.d, 100, 'scrolling back up must not undo having been down');
+	assert.equal(s.h, 1000);
+	assert.equal(s.dh, 4000);
+	assert.equal(s.w, 1440);
+});
+
+test('depth is measured to the bottom of the window, not its top', () => {
+	const p = load({ docHeight: 4000, viewHeight: 1000 });
+
+	p.scrollTo(1000);  // window covers 1000..2000 of 4000
+	p.leave();
+	p.flush();
+
+	assert.equal(p.scrolls()[0].d, 50);
+});
+
+test('each page of a single-page app reports its own depth', () => {
+	const p = load({ path: '/one', docHeight: 4000, viewHeight: 1000 });
+	p.mlx('page', 'one');
+
+	p.scrollTo(3000);          // /one: all the way down
+	p.goto('/two');
+	p.scrollTo(0);             // the router puts the new page at the top
+	p.mlx('page', 'two');      // a new view; /one's depth is reported here
+	p.leave();                 // /two: only the first screen was ever shown
+	p.flush();
+
+	const depths = p.scrolls().map(s => s.d);
+	assert.deepEqual(depths, [100, 25], 'the first page was read to the end, the second was not');
+
+	// And each report belongs to the page it describes. `record` stamps the current location,
+	// so a report sent a moment too late is filed under the next page.
+	const urls = p.scrolls().map(s => s.u);
+	assert.ok(urls[0].endsWith('/one'), `first report filed under ${urls[0]}`);
+	assert.ok(urls[1].endsWith('/two'), `second report filed under ${urls[1]}`);
+});
+
+test('one view reports once, however it ends', () => {
+	// A visitor who navigates and then closes the tab must not send two reports for the
+	// second page and none for the first.
+	const p = load({ path: '/one', docHeight: 2000, viewHeight: 1000 });
+	p.leave();
+	p.leave();
+	p.flush();
+
+	assert.equal(p.scrolls().length, 1);
+});
+
+test('a page that grows after it arrives is measured against its real height', () => {
+	const p = load({ docHeight: 1000, viewHeight: 1000 });
+
+	// Fully seen, as far as anyone knows at this instant.
+	p.setDocHeight(5000);
+	p.scrollTo(0);
+	p.leave();
+	p.flush();
+
+	assert.equal(p.scrolls()[0].d, 20, 'the early 100% must not survive the page growing');
+	assert.equal(p.scrolls()[0].dh, 5000);
+});
+
+test('scroll can be switched off', () => {
+	const p = load({ attrs: { 'data-scroll': 'false' }, docHeight: 4000, viewHeight: 1000 });
+	p.scrollTo(2000);
+	p.leave();
+	p.flush();
+
+	assert.equal(p.scrolls().length, 0);
+});
+
+test('a page being looked at in the heatmap viewer reports nothing', () => {
+	const p = load({ search: '?modlixDesign=1', docHeight: 4000, viewHeight: 1000 });
+	p.scrollTo(3000);
+	p.leave();
+	p.flush();
+
+	assert.equal(p.scrolls().length, 0);
+});
+
+test('the report carries the page name the view was given, even late', () => {
+	// The app knows where it is some milliseconds after the browser does, so the name often
+	// arrives after the view it belongs to. The scroll report for that view has not been sent
+	// yet either, and it has to be filed under the same name the view ended up with — or the
+	// depth lands on an unnamed row while the view lands on a named one, and the two can
+	// never be read together.
+	const p = load({ path: '/', docHeight: 2000, viewHeight: 1000 });
+	p.mlx('page', 'homePage');
+	p.leave();
+	p.flush();
+
+	const [s] = p.scrolls();
+	assert.equal(s.g, 'homePage');
+	assert.equal(p.views()[0].g, 'homePage');
+});
+
+
+/* ---- forms ------------------------------------------------------------------------- */
+
+test('a submitted form is an event, however it was submitted', () => {
+	// The gap this closes: a form sent with the Enter key fires no click, so autocapture saw
+	// nothing at all. On a small site the contact form is the conversion.
+	const p = load({ attrs: { 'data-autocapture': 'true' } });
+	p.submit({ name: 'contact' });
+	p.flush();
+
+	const [e] = p.events().filter(e => e.e === 'form_submit');
+	assert.equal(e.l, 'contact');
+});
+
+test('the form label is a name somebody chose, in order of preference', () => {
+	const p = load({ attrs: { 'data-autocapture': 'true' } });
+	p.submit({ 'data-analytics-label': 'newsletter', name: 'nl', id: 'x' });
+	p.submit({ name: 'enquiry', id: 'y' });
+	p.submit({ id: 'quote' });
+	p.submit({});
+	p.flush();
+
+	const labels = p.events().filter(e => e.e === 'form_submit').map(e => e.l);
+	assert.deepEqual(labels, ['newsletter', 'enquiry', 'quote', 'form']);
+});
+
+test('a form submission carries nothing but its label', () => {
+	// A submit handler is the easiest place in an analytics script to collect an email address
+	// by accident, so this asserts the shape of the whole event rather than the absence of one
+	// field somebody thought of.
+	const p = load({ attrs: { 'data-autocapture': 'true' } });
+	p.submit({ name: 'contact', action: '/enquiry?email=someone@example.com' });
+	p.flush();
+
+	const [e] = p.events().filter(e => e.e === 'form_submit');
+	assert.deepEqual(Object.keys(e).sort(), ['e', 'l', 't', 'u']);
+});
+
+test('autocapture off means no form events either', () => {
+	const p = load({ attrs: { 'data-autocapture': 'false' } });
+	assert.throws(() => p.submit({ name: 'contact' }), /nothing is listening/);
 });

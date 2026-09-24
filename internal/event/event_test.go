@@ -176,3 +176,37 @@ func TestVersionOneRecordStillDecodes(t *testing.T) {
 		t.Errorf("fields that did not exist in version 1 came back non-zero: %+v", got)
 	}
 }
+
+// The same property one version later: a record written by the binary that had click columns
+// but not scroll ones must decode with the scroll fields zero.
+//
+// This is the test that makes the rolling deploy safe every time a column is appended, so it
+// is written to be copied: encode the way the PREVIOUS version did, decode with the current
+// code, and assert that what did not exist then is zero now rather than an error.
+func TestVersionTwoRecordStillDecodes(t *testing.T) {
+	e := filledEvent()
+	e.ClickX, e.ClickY, e.Viewport = 5000, 1200, 1440
+
+	v2 := []byte{2}
+	v2 = binary.AppendVarint(v2, e.TSServer)
+	v2 = binary.AppendVarint(v2, e.TSClient)
+	for _, s := range e.strings() {
+		v2 = binary.AppendUvarint(v2, uint64(len(s)))
+		v2 = append(v2, s...)
+	}
+	// Version 2 wrote exactly three numbers.
+	for _, n := range []int32{e.ClickX, e.ClickY, e.Viewport} {
+		v2 = binary.AppendVarint(v2, int64(n))
+	}
+
+	got, err := Decode(v2)
+	if err != nil {
+		t.Fatalf("a version 2 record no longer decodes: %v", err)
+	}
+	if got.ClickX != e.ClickX || got.ClickY != e.ClickY || got.Viewport != e.Viewport {
+		t.Errorf("the click columns did not survive: %+v", got)
+	}
+	if got.ScrollPct != 0 || got.ViewportH != 0 || got.DocH != 0 {
+		t.Errorf("fields that did not exist in version 2 came back non-zero: %+v", got)
+	}
+}

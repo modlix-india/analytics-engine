@@ -70,6 +70,27 @@ type Event struct {
 	ClickY   int32
 	Viewport int32 // css pixels of viewport width, for banding
 
+	// How far down the page a view got, and the two heights that give it meaning. Zero on
+	// everything that is not a $scroll report.
+	//
+	// ScrollPct is 0..100 of the document's FINAL height, measured to the bottom of the
+	// window rather than its top: the question is what somebody could have seen, and a page
+	// that fits on one screen was seen in full without anyone scrolling it.
+	//
+	// ViewportH and DocH travel with it because the percentage alone cannot answer the
+	// question underneath it — where the fold is. Median viewport height over median document
+	// height is the share of a page visible without scrolling, and that is the number that
+	// says whether a call to action is below it.
+	ScrollPct int32
+	ViewportH int32
+	DocH      int32
+
+	// Interactive is 1 when a click landed on something that does anything when clicked, and
+	// 0 when it did not. Only a $click carries it, and a 0 on a row written before the column
+	// existed is indistinguishable from a real dead click — which is why the reader requires
+	// the column to be present at all, rather than trusting a zero.
+	Interactive int32
+
 	// Props is the JSON tail: anything the caller sent that has no column. Stored as received
 	// so an unmodelled field is never silently dropped, and nothing in the fixed widget set
 	// filters on it.
@@ -89,7 +110,7 @@ type Event struct {
 // correct and queryable — no error anywhere, because nothing is wrong except the spelling.
 const NamePageview = "$pageview"
 
-const encodingVersion byte = 2
+const encodingVersion byte = 4
 
 // Encode appends the packed form of e to dst.
 //
@@ -197,11 +218,11 @@ func (e *Event) strings() []string {
 // each other, so a field added to one and not the other is visible rather than being a silent
 // shift of everything after it.
 func (e *Event) numbers() []int32 {
-	return []int32{e.ClickX, e.ClickY, e.Viewport}
+	return []int32{e.ClickX, e.ClickY, e.Viewport, e.ScrollPct, e.ViewportH, e.DocH, e.Interactive}
 }
 
 func (e *Event) numberPtrs() []*int32 {
-	return []*int32{&e.ClickX, &e.ClickY, &e.Viewport}
+	return []*int32{&e.ClickX, &e.ClickY, &e.Viewport, &e.ScrollPct, &e.ViewportH, &e.DocH, &e.Interactive}
 }
 
 func (e *Event) stringPtrs() []*string {
