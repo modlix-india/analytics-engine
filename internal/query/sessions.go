@@ -120,6 +120,13 @@ func (e *Engine) scanVisits(ctx context.Context, site string, s span, parts, par
 			return err
 		}
 		for _, f := range files {
+		// A scan is long enough that the client can be gone before it ends: /q has a 30s write
+		// timeout, and the four visit widgets on one dashboard used to take longer than that
+		// between them. Without this the work continues to completion for a response nobody
+		// will read, holding memory and IO that a live query wants.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			rows, err := parquet.ReadFile[sessRow](f)
 			if err != nil {
 				return fmt.Errorf("read raw %s: %w", filepath.Base(f), err)
@@ -173,9 +180,15 @@ func (e *Engine) scanVisits(ctx context.Context, site string, s span, parts, par
 }
 
 // eachVisit runs fn over every visit, one partition at a time.
+//
+// The count is taken over the WIDENED span, because that is what scanVisits reads: it extends by
+// sessIdle at each end so a visit straddling the boundary can be classified. Counting the
+// requested span instead would under-count the files and could pick one pass for a scan that
+// actually reads two days more.
 func (e *Engine) eachVisit(ctx context.Context, site string, s span, fn func(v *visit)) error {
-	for p := range visitorPartitions {
-		if err := e.scanVisits(ctx, site, s, visitorPartitions, p, fn); err != nil {
+	parts := e.partitionsFor(ctx, site, span{s.Start.Add(-sessIdle), s.End.Add(sessIdle)})
+	for p := range parts {
+		if err := e.scanVisits(ctx, site, s, parts, p, fn); err != nil {
 			return err
 		}
 	}
