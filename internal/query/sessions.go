@@ -120,10 +120,10 @@ func (e *Engine) scanVisits(ctx context.Context, site string, s span, parts, par
 			return err
 		}
 		for _, f := range files {
-		// A scan is long enough that the client can be gone before it ends: /q has a 30s write
-		// timeout, and the four visit widgets on one dashboard used to take longer than that
-		// between them. Without this the work continues to completion for a response nobody
-		// will read, holding memory and IO that a live query wants.
+			// A scan is long enough that the client can be gone before it ends: /q has a 30s write
+			// timeout, and the four visit widgets on one dashboard used to take longer than that
+			// between them. Without this the work continues to completion for a response nobody
+			// will read, holding memory and IO that a live query wants.
 			if err := ctx.Err(); err != nil {
 				return err
 			}
