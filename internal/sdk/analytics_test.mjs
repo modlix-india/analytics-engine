@@ -18,7 +18,19 @@ import { createContext, runInContext } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'analytics.js'), 'utf8');
+/*
+ * Which copy of the beacon these tests run against.
+ *
+ * Defaults to the readable source, because a failure there should point at a line someone can
+ * read. But the file the engine actually serves is the MINIFIED one, and a minifier is a
+ * program that rewrites this code — so the suite is run a second time, by sdk_test.go, with
+ * MLX_BEACON_FILE=analytics.min.js. Behaviour proven on the source it was written against
+ * means nothing if the served copy differs, and identifier renaming plus syntax rewriting is
+ * exactly the kind of change that is invisible until it is not.
+ */
+const BEACON_FILE = process.env.MLX_BEACON_FILE || 'analytics.js';
+
+const SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), BEACON_FILE), 'utf8');
 
 /**
  * A page with the beacon on it.
