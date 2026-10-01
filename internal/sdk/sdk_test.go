@@ -3,6 +3,7 @@ package sdk
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -63,5 +64,30 @@ func TestTheBeaconBehaves(t *testing.T) {
 	out, err := exec.Command(node, "--test", "analytics_test.mjs").CombinedOutput()
 	if err != nil {
 		t.Fatalf("the beacon's own tests failed:\n%s", out)
+	}
+}
+
+// TestTheMinifiedBeaconBehavesIdentically runs that same suite against the file the engine
+// actually serves.
+//
+// The suite above tests analytics.js, which no browser ever receives. Between it and the
+// visitor sits a minifier that renames every identifier and rewrites syntax, and a bug
+// introduced there would be invisible in review — the source still reads correctly, and the
+// only artefact is a file nobody opens. This is the test that would catch it.
+//
+// Skipped without node for the same reason as the suite above. TestMinifiedScriptIsCurrent is
+// the unconditional half: it needs no node, so a build host still cannot ship a stale beacon.
+func TestTheMinifiedBeaconBehavesIdentically(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; the minified beacon was not exercised")
+	}
+
+	cmd := exec.Command(node, "--test", "analytics_test.mjs")
+	cmd.Env = append(os.Environ(), "MLX_BEACON_FILE=analytics.min.js")
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the beacon passes its tests as source but FAILS once minified:\n%s", out)
 	}
 }
