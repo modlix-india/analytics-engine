@@ -312,6 +312,14 @@ type Engine struct {
 	// past from the same bucket without any backfill.
 	Remote objstore.Store
 
+	// RowsPerPartition caps how many raw rows one scan pass may hold in memory, and therefore
+	// how many passes a query takes. Zero means defaultRowsPerPartition.
+	//
+	// Exposed because the right value depends on the box: the default is sized for a few
+	// hundred MB, and a node with more headroom can read the files fewer times by raising it.
+	// Lowering it is the lever if a large site's scans start pressing on memory.
+	RowsPerPartition int64
+
 	// CacheDir holds files fetched from Remote. Defaults to DataDir/cache.
 	CacheDir string
 

@@ -12,7 +12,9 @@ import (
 )
 
 // fixture writes raw and rollup tiers for the given events, exactly as compaction would.
-func fixture(t *testing.T, rows []store.Row) string {
+// testing.TB rather than *testing.T so benchmarks can build the same fixture; the body only
+// uses Helper, TempDir and Fatal, which TB provides.
+func fixture(t testing.TB, rows []store.Row) string {
 	t.Helper()
 	dir := t.TempDir()
 
