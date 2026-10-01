@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/maphash"
+	"os"
 	"path/filepath"
 	"sort"
 	"time"
@@ -38,17 +39,119 @@ type seqEvent struct {
 	Name string
 }
 
-// visitorPartitions is how many slices the scan is split into.
+// visitorPartitions is the MAXIMUM number of slices a scan is split into.
 //
 // The trade is memory against IO: more partitions hold fewer visitors at once but re-read the
 // files once each. Sixteen keeps a month of a large site within a few hundred MB while costing
 // sixteen passes over a projection that is already small.
+//
+// It used to be the FIXED count, and that is what made the dashboard slow. Every pass decodes
+// every file in range and keeps 1/16 of the rows, so sixteen passes decode the same bytes
+// sixteen times. A dashboard load fires the four visit widgets separately, which is
+// 4 x 16 = 64 full reads of the raw data for one screen. Measured on production 2026-09-30,
+// that is 6.2-7.0s per widget on a site with a few thousand rows a day - a memory guarantee
+// designed for the largest sites, charged in full to every site regardless of size.
+//
+// Now it is a ceiling, and partitionsFor picks the count from the data actually in range.
 const visitorPartitions = 16
+
+// defaultRowsPerPartition is how many raw rows one pass may hold in memory.
+//
+// Derived from the budget the sixteen-partition comment above describes: a few hundred MB for
+// the largest site. A held event is a timestamp plus two short strings and its share of the map,
+// which amortises to roughly 200 bytes, so ~1.5M rows is ~300MB. A site whose range fits inside
+// this reads the files ONCE; a large one still gets up to sixteen passes and the same ceiling on
+// memory it had before.
+const defaultRowsPerPartition = 1_500_000
 
 var visitorSeed = maphash.MakeSeed()
 
 func partitionOf(visitor string, parts int) int {
 	return int(maphash.String(visitorSeed, visitor) % uint64(parts))
+}
+
+func (e *Engine) rowsPerPartition() int64 {
+	if e.RowsPerPartition > 0 {
+		return e.RowsPerPartition
+	}
+	return defaultRowsPerPartition
+}
+
+// countRows sums the row counts of the files in range from their Parquet FOOTERS.
+//
+// Metadata only: the footer carries NumRows per row group, so this costs a seek and a small read
+// per file rather than a decode. Page indexes and bloom filters are skipped because nothing here
+// reads them and they are the expensive part of opening a file.
+func (e *Engine) countRows(ctx context.Context, site string, s span) (int64, error) {
+	var total int64
+	for _, date := range utcDates(s) {
+		files, err := e.filesIn(ctx, "data", site, date)
+		if err != nil {
+			return 0, err
+		}
+		for _, path := range files {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			n, err := footerRows(path)
+			if err != nil {
+				return 0, err
+			}
+			total += n
+		}
+	}
+	return total, nil
+}
+
+func footerRows(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	pf, err := parquet.OpenFile(f, st.Size(),
+		parquet.SkipPageIndex(true),
+		parquet.SkipBloomFilters(true),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("footer %s: %w", filepath.Base(path), err)
+	}
+	return pf.NumRows(), nil
+}
+
+// partitionsFor picks how many passes a scan needs, from the rows actually in range.
+//
+// The span passed here must be the one that will be SCANNED, not the one the caller asked for:
+// scanVisits widens by sessIdle at each end and scanVisitors does not, so they count different
+// files and must say so.
+//
+// A counting failure is not a query failure. Falling back to the maximum keeps the old
+// behaviour - slower, but with the memory guarantee intact, which is the safe direction to be
+// wrong in.
+func (e *Engine) partitionsFor(ctx context.Context, site string, s span) int {
+	rows, err := e.countRows(ctx, site, s)
+	if err != nil {
+		if e.Log != nil {
+			e.Log.Warn("partition sizing fell back to the maximum", "site", site, "err", err)
+		}
+		return visitorPartitions
+	}
+
+	budget := e.rowsPerPartition()
+	parts := int((rows + budget - 1) / budget) // ceil
+	if parts < 1 {
+		parts = 1
+	}
+	if parts > visitorPartitions {
+		parts = visitorPartitions
+	}
+	return parts
 }
 
 // scanVisitors calls fn once per visitor in the given partition, with that visitor's events in
@@ -65,6 +168,13 @@ func (e *Engine) scanVisitors(ctx context.Context, site string, s span, parts, p
 			return err
 		}
 		for _, f := range files {
+		// A scan is long enough that the client can be gone before it ends: /q has a 30s write
+		// timeout, and the four visit widgets on one dashboard used to take longer than that
+		// between them. Without this the work continues to completion for a response nobody
+		// will read, holding memory and IO that a live query wants.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			rows, err := parquet.ReadFile[seqRow](f)
 			if err != nil {
 				return fmt.Errorf("read raw %s: %w", filepath.Base(f), err)
@@ -96,9 +206,12 @@ func (e *Engine) scanVisitors(ctx context.Context, site string, s span, parts, p
 }
 
 // eachVisitor runs fn over every visitor, one partition at a time.
+//
+// scanVisitors reads exactly the requested span, so that is what the count is taken over.
 func (e *Engine) eachVisitor(ctx context.Context, site string, s span, fn func(visitor string, evs []seqEvent)) error {
-	for p := range visitorPartitions {
-		if err := e.scanVisitors(ctx, site, s, visitorPartitions, p, fn); err != nil {
+	parts := e.partitionsFor(ctx, site, s)
+	for p := range parts {
+		if err := e.scanVisitors(ctx, site, s, parts, p, fn); err != nil {
 			return err
 		}
 	}
