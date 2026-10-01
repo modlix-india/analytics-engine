@@ -14,7 +14,17 @@ import (
 	"time"
 )
 
-//go:embed analytics.js
+// The SERVED copy is the minified one; analytics.js is the readable one and the thing to edit.
+// Regenerate with `go generate ./...` after changing it — or let the test tell you, which it
+// will.
+//
+// The split is worth its one generated file. Roughly 60% of analytics.js is comment, and those
+// comments are the only documentation this script has, so stripping them at the source is not
+// an option. Minified and brotli-compressed, which is what the edge actually serves, the beacon
+// goes from 7.8 KB to 2.1 KB on every cold load of every page of every customer site.
+//
+//go:generate go run ./minifier/cmd -in analytics.js -out analytics.min.js
+//go:embed analytics.min.js
 var script []byte
 
 // etag is content-derived, so a rebuild that does not change the script does not invalidate
