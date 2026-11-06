@@ -153,6 +153,9 @@ type Request struct {
 	// no data in it.
 	Compare string
 
+	// AIOnly narrows crawlerVisits to AI crawlers.
+	AIOnly bool
+
 	Limit int
 }
 
@@ -235,6 +238,10 @@ type Result struct {
 	Heatmap    *Heatmap           `json:"heatmap,omitempty"`
 	Scroll     *Scroll            `json:"scroll,omitempty"`
 	Friction   *Friction          `json:"friction,omitempty"`
+
+	// The answer engine widgets' own sections; see ai.go.
+	Crawl       *Crawl       `json:"crawl,omitempty"`
+	AIReferrals *AIReferrals `json:"aiReferrals,omitempty"`
 
 	// RangeRelative marks a result whose meaning depends on the queried window rather than
 	// on all of history — lifecycle, where a long-standing visitor counts as new if their
@@ -518,6 +525,10 @@ func (e *Engine) dispatch(ctx context.Context, req Request, loc *time.Location) 
 		return e.heatmap(ctx, req)
 	case WidgetHeatmapPages:
 		return e.heatmapPages(ctx, req)
+	case WidgetCrawlerVisits:
+		return e.crawlerVisits(ctx, req, loc)
+	case WidgetAIReferrals:
+		return e.aiReferrals(ctx, req, loc)
 	case WidgetBreakdownByProperty:
 		if !propertyDims[req.Property] {
 			return nil, fmt.Errorf("query: %q is not a dimension this engine breaks down by", req.Property)

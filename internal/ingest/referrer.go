@@ -94,6 +94,14 @@ func Channel(refHost, pageHost string, utm UTM) string {
 		return "internal"
 	}
 
+	// An AI answer that linked here, before the medium rules: ChatGPT stamps
+	// utm_source=chatgpt.com on its links with no medium at all, and gemini.google.com would
+	// otherwise be read as a Google search. A paid campaign that happens to name an assistant
+	// as its source is still paid, so that is decided first.
+	if !isPaidMedium(utm.Medium) && !utm.hasClickID && AISource(refHost, utm.Source) != "" {
+		return ChannelAI
+	}
+
 	switch strings.ToLower(utm.Medium) {
 	case "cpc", "ppc", "paid", "paidsearch", "paid_search", "cpm", "cpv", "display", "banner":
 		return "paid"
@@ -126,6 +134,16 @@ func Channel(refHost, pageHost string, utm UTM) string {
 		return "social"
 	}
 	return "referral"
+}
+
+// isPaidMedium is the paid half of the medium switch in Channel, named so the AI rule can ask
+// it without repeating the list.
+func isPaidMedium(medium string) bool {
+	switch strings.ToLower(medium) {
+	case "cpc", "ppc", "paid", "paidsearch", "paid_search", "cpm", "cpv", "display", "banner":
+		return true
+	}
+	return false
 }
 
 // sameSite treats www and the bare domain as one site, since a link from www.example.com to
