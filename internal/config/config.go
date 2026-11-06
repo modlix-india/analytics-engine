@@ -78,6 +78,11 @@ type Config struct {
 	// is a data leak that announces itself to no one.
 	QuerySecret string
 
+	// ServerSecret authorises POST /c, where a rendering server reports the pages crawlers
+	// fetched. Empty leaves the route unregistered. Separate from QuerySecret on purpose: the
+	// server that writes crawl visits has no business reading every site's numbers.
+	ServerSecret string
+
 	// Object storage. Empty Bucket disables replication entirely and everything stays local,
 	// which is the right default for development and for a single-node deployment that has
 	// its own backups.
@@ -178,6 +183,7 @@ func Load() (Config, error) {
 		MaxBatchEvents:  envInt("ANALYTICS_MAX_BATCH_EVENTS", 500),
 		MaxBodyBytes:    envInt64("ANALYTICS_MAX_BODY_BYTES", 1<<20),
 		QuerySecret:     os.Getenv("ANALYTICS_QUERY_SECRET"),
+		ServerSecret:    os.Getenv("ANALYTICS_SERVER_SECRET"),
 		VisitorSecret:   os.Getenv("ANALYTICS_VISITOR_SECRET"),
 
 		// Both spellings are accepted. The platform's existing stacks already pass OCI_S3_*

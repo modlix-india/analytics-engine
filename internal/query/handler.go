@@ -65,6 +65,9 @@ type request struct {
 	Variant  string `json:"variant"`
 	Viewport int32  `json:"viewport"`
 
+	// crawlerVisits only: AI crawlers alone.
+	AIOnly bool `json:"aiOnly"`
+
 	Limit int `json:"limit"`
 }
 
@@ -126,6 +129,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Steps: req.Steps, WindowHours: req.WindowHours, Period: req.Period,
 		Path: req.Path, Page: req.Page, Variant: req.Variant, Viewport: req.Viewport,
 		Compare: req.Compare,
+		AIOnly:  req.AIOnly,
 		Limit:   req.Limit,
 	})
 	if err != nil {

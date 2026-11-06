@@ -200,6 +200,18 @@ func run() error {
 		},
 	})
 
+	// Crawler visits, reported by the rendering server. Off without a secret.
+	var crawl http.HandlerFunc
+	if cfg.ServerSecret != "" {
+		crawl = ingest.NewCrawl(ingest.CrawlOptions{
+			Sink: w, Log: log, Secret: cfg.ServerSecret,
+			MaxBatchEvents: cfg.MaxBatchEvents, MaxBodyBytes: cfg.MaxBodyBytes,
+			OnEvent: func(outcome string) { m.EventsReceived.WithLabelValues(outcome).Inc() },
+		}).Handle
+	} else {
+		log.Info("crawler visits not accepted: ANALYTICS_SERVER_SECRET is not set")
+	}
+
 	// Object storage is optional. Without it everything stays local, which is correct for
 	// development and for a single node with its own backups.
 	var remote objstore.Store
@@ -270,6 +282,7 @@ func run() error {
 		Log:     log,
 		Metrics: m,
 		Ingest:  ing.Handle,
+		Crawl:   crawl,
 		SDK:     sdk.Handler(),
 		Query: &query.Handler{
 			Engine: &query.Engine{
