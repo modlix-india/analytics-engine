@@ -42,6 +42,10 @@ type Options struct {
 	// does not expose a public write endpoint it never intended to serve.
 	Ingest http.HandlerFunc
 
+	// Crawl handles POST /c, the crawler visits a rendering server reports. Server to
+	// server and authenticated, so it gets no CORS. Nil leaves it unregistered.
+	Crawl http.HandlerFunc
+
 	// Query handles POST /q. Nil leaves it unregistered, for an ingest-only node.
 	Query http.Handler
 
@@ -65,6 +69,9 @@ func New(o Options) *Server {
 		// against this endpoint will preflight, and a 405 there looks like the engine
 		// being down rather than like a missing header.
 		mux.Handle("OPTIONS /i", s.instrument("ingest", http.HandlerFunc(preflight)))
+	}
+	if o.Crawl != nil {
+		mux.Handle("POST /c", s.instrument("crawl", o.Crawl))
 	}
 	if o.SDK != nil {
 		mux.Handle("GET /a.js", s.instrument("sdk", o.SDK))

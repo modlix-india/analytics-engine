@@ -35,6 +35,7 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 | `ANALYTICS_MAX_BODY_BYTES` | `1MiB` | bound on one ingest request |
 | `ANALYTICS_LOG_LEVEL` | `info` | |
 | `ANALYTICS_QUERY_SECRET` | — | reads are denied entirely without it |
+| `ANALYTICS_SERVER_SECRET` | unset | enables `POST /c` (crawler visits from the rendering server); unset leaves the route off |
 | `ANALYTICS_VISITOR_SECRET` | — | makes the daily visitor salt survive a restart; **share it across the fleet** |
 | `ANALYTICS_S3_BUCKET` | — | set to enable object storage; everything stays local otherwise |
 | `ANALYTICS_S3_ENDPOINT` | — | `http://` prefix selects plaintext; anything else uses TLS |
@@ -58,6 +59,7 @@ nodes sharing an id would collide silently, so the process refuses to start inst
 | `GET /readyz` | this node can accept writes |
 | `GET /a.js` | the browser beacon, served by the engine that receives its events |
 | `POST /i` | ingest a batch — public, write-only, answers 204 either way |
+| `POST /c` | crawler visits reported by the rendering server, with bearer `ANALYTICS_SERVER_SECRET`, never routed through the public Worker |
 | `POST /q` | run one of the fixed widgets — see below |
 | `GET /metrics` | Prometheus |
 
@@ -171,7 +173,7 @@ curl -X POST http://localhost:8080/q -H 'Authorization: Bearer $ANALYTICS_QUERY_
 | `eventTimeline` | local calendar day, for a named `event` |
 | `topPages` | path |
 | `topReferrers` | referrer host |
-| `channelBreakdown` | direct / organic / social / paid / referral / email |
+| `channelBreakdown` | direct / organic / social / paid / referral / email / ai |
 | `deviceBreakdown` | desktop / mobile / tablet |
 | `browserBreakdown` | browser |
 | `osBreakdown` | operating system |
@@ -193,6 +195,8 @@ curl -X POST http://localhost:8080/q -H 'Authorization: Bearer $ANALYTICS_QUERY_
 | `scrollPages` | the pages that have scroll reports at all, ranked |
 | `heatmapPages` | the pages that have clicks at all, ranked |
 | `heatmap` | where clicks landed on ONE page, as a grid — takes `path`, and optionally `variant` and `viewport` |
+| `crawlerVisits` | crawler page fetches by bot and by page, with the latest status and a per-day count; `aiOnly` narrows it to AI crawlers |
+| `aiReferrals` | visits that came from an AI answer, by assistant, with landing pages and a per-day count, plus `audience` |
 
 `breakdownByProperty` accepts only an allow-listed dimension: `path`, `page`, `label`,
 `referrer_host`, `channel`, `utm_source`, `utm_medium`, `utm_campaign`, `device`, `browser`,
@@ -286,6 +290,30 @@ conversion, it reports it as a drop-off, so it is refused rather than answered.
 answered at all while identity rotates daily: every visitor is new every day, and stickiness
 reports one period for everybody. They remain implemented and tested, and they are not on any
 dashboard.
+
+## AI answers: crawler visits and referrals
+
+**A visit from an AI answer is channel `ai`.** The referrer (chatgpt.com, perplexity.ai,
+copilot.microsoft.com, gemini.google.com, claude.ai and the others in `ingest/ai.go`) or the
+landing URL's `utm_source` (ChatGPT stamps `utm_source=chatgpt.com`) decides it, before the
+search rule, because gemini.google.com would otherwise be read as a Google search. A paid
+campaign that names an assistant is still paid. `aiReferrals` decides the assistant again from
+the stored referrer and utm_source rather than from the channel column, so it also counts
+visits stored before the channel existed.
+
+**Crawlers are seen by the server, not the beacon.** Most AI crawlers run no JavaScript. The
+rendering server reports each page a known crawler fetched to `POST /c`:
+
+```bash
+curl -X POST http://localhost:8080/c -H "Authorization: Bearer $ANALYTICS_SERVER_SECRET" -d '{
+  "b": [{"s": "monkbars_SYSTEM", "u": "/page/home", "bot": "GPTBot", "ai": true, "st": 200}]
+}'
+```
+
+They are stored as `$crawl` under the site `<site>.crawl`, a partition of their own, so no
+traffic widget can count a crawler as a page view, an event or a visit. `crawlerVisits` reads
+that partition for the site the caller was authorised for. A crawler visit keeps the bot's
+name, the path, the status and the time, and nothing that identifies anyone.
 
 ## Durability
 
